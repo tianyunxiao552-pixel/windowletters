@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -37,6 +37,15 @@ _AGGRESSIVE_KEYWORDS = (
     "野鸡",
     "畜生",
     "傻🐦",
+    "笑成区",
+    "闹麻",
+    "够童",
+    "招笑",
+    "煞笔",
+    "臭婊子",
+    "去死",
+    "去亖",
+    "有攻击性",
 )
 _PRIVACY_RE = re.compile(
     r"(?:\b\d{7,}\b|[A-Za-z]{2,}\d{5,}|身份证|银行卡|手机号|验证码|密码|收件地址|学住费|航财通|xwt\d+)",

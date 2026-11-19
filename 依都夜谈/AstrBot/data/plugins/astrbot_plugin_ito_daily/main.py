@@ -32,7 +32,7 @@ from .memory import GroupMemoryStore
 from .output_filter import clean_wechat_text, is_skip_reply, split_natural_bubbles
 from .persona_loader import PersonaLoader
 from .personal_kb import PersonalKnowledgeBase
-from .reply_policy import select_reply
+from .reply_policy import QUOTE_SELF_WINDOW_SECONDS, select_reply
 from .style_rag import StyleCorpusRetriever, discover_default_corpus
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -50,6 +50,8 @@ class ItoDaily(Star):
         self.task = None
         self.last_proactive = float("-inf")
         self.last_pat = float("-inf")
+        self.last_image = float("-inf")
+        self._quote_times: dict[str, list[float]] = {}
         self.context_buffer = GroupContextBuffer(max_items=36, max_age_seconds=2700.0)
         self.members = MemberDirectory(ttl_seconds=600.0)
         self.memory = GroupMemoryStore(MEMORY_PATH)
@@ -60,7 +62,7 @@ class ItoDaily(Star):
             if ENABLE_STYLE_RAG
             else StyleCorpusRetriever(())
         )
-        self._last_synced_core: str | None = None
+        self._last_synced_state: tuple[str, tuple[str, ...]] | None = None
         if self.personal_kb.review_count or self.personal_kb.item_count:
             logger.info(
                 "已挂载赛博复制人个人记忆库：%d 部作品评分 · %d 篇长评动态 · %d 条个人档案",
@@ -76,17 +78,27 @@ class ItoDaily(Star):
             return
         try:
             core = self.persona_loader.core_prompt()
+            dialogs = self.persona_loader.begin_dialogs()
         except OSError:
             return
-        if not core or core == self._last_synced_core:
+        state = (core, tuple(dialogs))
+        if not core or state == self._last_synced_state:
             return
         pm = getattr(self.context, "persona_manager", None)
         if pm is None:
             return
         try:
-            await pm.update_persona(persona_id=PERSONA_ID, system_prompt=core)
-            self._last_synced_core = core
-            logger.info("依都核心人格卡已自动热同步至 AstrBot（%d 字）", len(core))
+            await pm.update_persona(
+                persona_id=PERSONA_ID,
+                system_prompt=core,
+                begin_dialogs=dialogs,
+            )
+            self._last_synced_state = state
+            logger.info(
+                "依都核心人格卡已自动热同步至 AstrBot（%d 字 · %d 组原生真声示范）",
+                len(core),
+                len(dialogs) // 2,
+            )
         except Exception as exc:
             logger.warning("自动热同步人格卡失败，将在请求层兜底：%s", type(exc).__name__)
 
@@ -121,6 +133,8 @@ class ItoDaily(Star):
         raw = event.message_obj.raw_message
         if not isinstance(raw, dict):
             return
+
+        await self._sync_persona_if_needed()
 
         client = adapter.get_client()
         sender_id = event.get_sender_id() or ""
@@ -161,9 +175,21 @@ class ItoDaily(Star):
         mentioned = isinstance(mentions, dict) and mentions.get("state") == "known" and mentions.get("self") is True
         patted_self = isinstance(pat_info, dict)
         is_text_like = raw.get("type") == 1 or (raw.get("type") == 49 and raw.get("appMessageType") == 57)
-        has_text = is_text_like and bool(event.message_str.strip())
+        has_text = (is_text_like and bool(event.message_str.strip())) or has_image
+        policy_text = (
+            event.message_str
+            if (is_text_like and event.message_str.strip())
+            else ("[图片]" if has_image else "")
+        )
 
         now = time.monotonic()
+        sender_quote_hist = [
+            t for t in self._quote_times.get(sender_id, [])
+            if (now - t) < QUOTE_SELF_WINDOW_SECONDS
+        ]
+        if sender_id:
+            self._quote_times[sender_id] = sender_quote_hist
+
         mode = select_reply(
             mentioned,
             has_text,
@@ -172,8 +198,16 @@ class ItoDaily(Star):
             quoted_self=quoted_self,
             patted_self=patted_self,
             since_last_pat=now - self.last_pat,
-            text=event.message_str,
+            text=policy_text,
+            recent_quote_count=len(sender_quote_hist),
+            has_image=has_image,
+            since_last_image=now - self.last_image,
         )
+        if mode == "quote_self" and sender_id:
+            sender_quote_hist.append(now)
+            self._quote_times[sender_id] = sender_quote_hist
+        elif mode == "image":
+            self.last_image = now
 
         event.set_extra("ito_trigger_mode", mode)
         event.set_extra("ito_sender_name", display_name)
@@ -256,11 +290,10 @@ class ItoDaily(Star):
             )
 
         rag_query = f"{event.message_str or ''} {quote_text} {recent_transcript[-240:]}"
-        style_samples = self.style_rag.format_for_prompt(rag_query, limit=5)
+        style_samples = self.style_rag.format_for_prompt(rag_query, limit=3)
         if style_samples:
             extra_blocks.append(
-                "## 你平时在群里说话的真实原话参考（重点学这种收着劲的松弛感、短句换行节奏和冷幽默，"
-                "不要鸡血报菜名、不要用网络油腻段子腔，不要照抄原句）\n"
+                "## 同话题真实聊天原话参考（只参考语感与断句，不要照抄）\n"
                 + style_samples
             )
 
@@ -279,19 +312,24 @@ class ItoDaily(Star):
             )
         elif mode == "quote_self":
             extra_blocks.append(
-                f"## 当前互动\n群友「{sender_name}」专门引用了你刚才说的话"
+                f"## 当前互动\n群友「{sender_name}」引用了你刚才说的话"
                 + (f"（原话：「{quote_text[:160]}」）" if quote_text else "")
-                + "来回复你。紧扣你刚才那句话和对方的新回复接招。"
+                + "来回复你。顺着对方的话温柔平和地聊下去，绝不顶嘴或嘲讽。"
             )
         elif mode == "proactive":
             extra_blocks.append(
                 f"## 当前互动\n这是群友「{sender_name}」在群里的普通发言，对方没有叫你。"
-                "先看懂上面的【刚才的群聊现场】，确认你能接上真正的梗、反差或实在话再自然插一句；"
-                "如果上下文太散、是别人私密事、或者实在没必要插嘴，请只输出 [SKIP] 保持安静。"
+                "先看懂上面的【刚才的群聊现场】，确认你能温柔、自然地接上一句暖心或实在的话再开口；"
+                "绝不嘲讽别人的失利或战绩。如果没必要插嘴，请只输出 [SKIP] 这六个字符，不要附带任何解释。"
+            )
+        elif mode == "image":
+            extra_blocks.append(
+                f"## 当前互动\n群友「{sender_name}」在群里发了一张图片（已由视觉模型转述在消息里）。"
+                "结合【刚才的群聊现场】和图片内容温柔、友好地接一句（如果是战绩不佳或亏钱，要真心安慰鼓励，绝不嘲讽）；如果没啥好说的只输出 [SKIP]。"
             )
         else:
             extra_blocks.append(
-                f"## 当前互动\n群友「{sender_name}」在群里直接 @ 了你。结合【刚才的群聊现场】自然回应。"
+                f"## 当前互动\n群友「{sender_name}」在群里直接 @ 了你。结合【刚才的群聊现场】温柔、自然地回应。"
             )
 
         if extra_blocks:

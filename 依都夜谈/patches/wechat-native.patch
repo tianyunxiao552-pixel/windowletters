@@ -1,5 +1,5 @@
 diff --git a/adapter.py b/adapter.py
-index 69855f3..eb542ff 100644
+index 69855f3..91370c6 100644
 --- a/adapter.py
 +++ b/adapter.py
 @@ -13,9 +13,12 @@ from pathlib import Path
@@ -28,6 +28,15 @@ index 69855f3..eb542ff 100644
  from .friend_requests import FriendRequests
  from .history_tools import HistoryTools
  from .loop_guard import LoopGuard
+@@ -62,7 +67,7 @@ from .native_client import (
+     load_outgoing_voice,
+ )
+ from .state import StateStore, cursor_number, state_path
+-from .sticker_service import StickerService, quoted_sticker_candidate
++from .sticker_service import StickerService, is_sticker, quoted_sticker_candidate
+ from .summary import GroupSummaryCache, is_summary_command
+ from .wechat_actions import WeChatActions
+ 
 @@ -231,15 +236,24 @@ class WeChatNativeAdapter(Platform):
  
          if origin != "live":
@@ -56,7 +65,39 @@ index 69855f3..eb542ff 100644
          msg_type = raw.get("type")
          if msg_type == 49 and raw.get("appMessageType") in RED_PACKET_APP_TYPES:
              thread = raw["threadId"]
-@@ -327,11 +341,17 @@ class WeChatNativeAdapter(Platform):
+@@ -253,6 +267,7 @@ class WeChatNativeAdapter(Platform):
+             return "red_packet" if self._check_timestamp(raw) else ignored("invalid_timestamp")
+         is_direct_image = msg_type == 3
+         is_direct_voice = msg_type == 34
++        is_direct_sticker = cfg.enable_stickers and is_sticker(raw)
+         # Native exposes a file's name only through its media asset, so a direct
+         # file is only a candidate here; non-PDF files are dropped after that lookup.
+         is_direct_file = msg_type == 49 and raw.get("appMessageType") == 6
+@@ -271,7 +286,7 @@ class WeChatNativeAdapter(Platform):
+         )
+         body = raw.get("body")
+         has_text_body = isinstance(body, str) and bool(body.strip())
+-        if is_direct_image or is_direct_voice:
++        if is_direct_image or is_direct_voice or is_direct_sticker:
+             if not cfg.enable_media:
+                 return ignored("media_disabled")
+             if body is not None and not isinstance(body, str):
+@@ -307,8 +322,12 @@ class WeChatNativeAdapter(Platform):
+             return ignored("group_reply_disabled")
+         if cfg.allowed_groups and thread not in cfg.allowed_groups:
+             return ignored("group_not_allowed")
+-        if is_direct_image:
+-            return ignored("direct_group_image")
++        if is_direct_image or is_direct_sticker:
++            return (
++                "media"
++                if cfg.group_reply_mode == "probability"
++                else ignored("direct_group_image")
++            )
+         if is_direct_file:
+             return ignored("direct_group_file")
+         mentions = raw.get("mentions")
+@@ -327,11 +346,17 @@ class WeChatNativeAdapter(Platform):
                  if cfg.group_reply_mode in {"all", "probability"} or mentioned
                  else ignored("voice_without_mention")
              )
@@ -76,7 +117,35 @@ index 69855f3..eb542ff 100644
              return "text"
          return ignored("group_without_mention")
  
-@@ -1013,6 +1033,53 @@ class WeChatNativeAdapter(Platform):
+@@ -660,7 +685,10 @@ class WeChatNativeAdapter(Platform):
+                 try:
+                     async with asyncio.timeout(self.client.media_timeout):
+                         if is_sticker:
+-                            data, _ = await self.stickers.read_quote(raw, guard=guard)
++                            if is_quote:
++                                data, _ = await self.stickers.read_quote(raw, guard=guard)
++                            else:
++                                data, _ = await self.stickers.read_direct(raw, guard=guard)
+                             image_bytes = await asyncio.to_thread(sticker_preview, data)
+                         elif is_voice:
+                             if is_quote or recent_request:
+@@ -803,6 +831,15 @@ class WeChatNativeAdapter(Platform):
+                 ):
+                     self.state.mark_message(message_id, "no_reply")
+                 return
++            if (
++                thread.endswith("@chatroom")
++                and not is_quote
++                and not recent_request
++                and (raw.get("type") == 3 or is_sticker)
++            ):
++                if not self._state_closed and self.state.message_status(message_id) == "queued":
++                    self.state.mark_message(message_id, "no_reply")
++                return
+             try:
+                 sent = await self.send_chain(
+                     thread,
+@@ -1013,6 +1050,53 @@ class WeChatNativeAdapter(Platform):
              ):
                  await self._reply_to_red_packet(raw)
              return
@@ -130,6 +199,16 @@ index 69855f3..eb542ff 100644
          eligible = kind != "ignore"
          cacheable = self.native_config.enable_group_summary and self._eligible(
              raw, origin, summary=True
+@@ -1065,7 +1149,8 @@ class WeChatNativeAdapter(Platform):
+                 recent_kind
+                 or (
+                     "sticker"
+-                    if self.native_config.enable_stickers and quoted_sticker_candidate(raw)
++                    if self.native_config.enable_stickers
++                    and (is_sticker(raw) or quoted_sticker_candidate(raw))
+                     else "voice"
+                     if raw.get("type") == 34
+                     or (isinstance(quote, dict) and quote.get("type") == 34)
 diff --git a/loop_guard.py b/loop_guard.py
 index 6d40b45..b904668 100644
 --- a/loop_guard.py
@@ -182,6 +261,51 @@ index 6d40b45..b904668 100644
              self.trip(thread, "hard_limit")
              return
          rounds = list(trace.events)[-6:]
+diff --git a/sticker_service.py b/sticker_service.py
+index c7e42de..3e1790d 100644
+--- a/sticker_service.py
++++ b/sticker_service.py
+@@ -224,6 +224,40 @@ class StickerService:
+         data, asset, _ = await self.read_quote_with_source(raw, original=original, guard=guard)
+         return data, asset
+ 
++    async def read_direct(self, raw, *, original=False, guard=None):
++        try:
++            async with asyncio.timeout(self.adapter.client.media_timeout):
++                if guard:
++                    guard()
++                source_message_id = raw["id"]
++                assets = await self.adapter.client.sticker_assets(
++                    source_message_id, quoted=False
++                )
++                candidates = [a for a in assets if not original or a.get("variant") == "original"]
++                if not candidates:
++                    raise MediaError("unsupported_format", media_kind="sticker")
++                asset = sorted(candidates, key=lambda a: a.get("variant") != "original")[0]
++                if asset.get("state") == "pending":
++                    await self.transfer(raw, asset, source_message_id=source_message_id)
++                    assets = await self.adapter.client.sticker_assets(
++                        source_message_id, quoted=False
++                    )
++                    asset = next((a for a in assets if a["id"] == asset["id"]), None)
++                    if asset is None:
++                        raise MediaError("unavailable", media_kind="sticker")
++                data = await self.adapter.client.sticker_content(asset, original=original)
++                if guard:
++                    guard()
++                return data, asset
++        except NativeAPIError as error:
++            from .native_client import _map_media_code
++
++            raise _map_media_code(
++                error.code, quoted=False, status=error.status, media_kind="sticker"
++            ) from None
++        except TimeoutError:
++            raise MediaError("unavailable", media_kind="sticker") from None
++
+     def claim(self, raw, action, content_id, source):
+         digest = source_hash(source)
+         key = "astrbot-sticker-" + source_hash(
 diff --git a/pat.py b/pat.py
 new file mode 100644
 index 0000000..d258b25

@@ -10,6 +10,10 @@ _CORE_RE = re.compile(
     r"<!--\s*ITO:CORE_START\s*-->(.*?)<!--\s*ITO:CORE_END\s*-->",
     re.DOTALL,
 )
+_FEWSHOT_RE = re.compile(
+    r"<!--\s*ITO:FEWSHOT_START\s*-->(.*?)<!--\s*ITO:FEWSHOT_END\s*-->",
+    re.DOTALL,
+)
 _MODULE_RE = re.compile(
     r"<!--\s*ITO:MODULE:([a-zA-Z0-9_-]+)\s*-->(.*?)<!--\s*ITO:MODULE_END\s*-->",
     re.DOTALL,
@@ -349,6 +353,23 @@ class ParsedCard:
     full_text: str
     core: str
     modules: dict[str, str]
+    begin_dialogs: tuple[str, ...] = ()
+
+
+def _parse_fewshot_dialogs(raw_block: str) -> tuple[str, ...]:
+    dialogs: list[str] = []
+    for chunk in re.split(r"(?m)^\s*---\s*$", raw_block.strip()):
+        q_text = ""
+        a_text = ""
+        for line in chunk.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Q:"):
+                q_text = stripped[2:].strip().replace("\\n", "\n")
+            elif stripped.startswith("A:"):
+                a_text = stripped[2:].strip().replace("\\n", "\n")
+        if q_text and a_text:
+            dialogs.extend((q_text, a_text))
+    return tuple(dialogs)
 
 
 class PersonaLoader:
@@ -364,18 +385,23 @@ class PersonaLoader:
             return self._parsed
         raw = self.path.read_text(encoding="utf-8-sig")
         core_match = _CORE_RE.search(raw)
+        fewshot_match = _FEWSHOT_RE.search(raw)
         modules = {
             m.group(1).strip().lower(): m.group(2).strip()
             for m in _MODULE_RE.finditer(raw)
             if m.group(2).strip()
         }
         core = core_match.group(1).strip() if core_match else raw.strip()
-        self._parsed = ParsedCard(full_text=raw.strip(), core=core, modules=modules)
+        dialogs = _parse_fewshot_dialogs(fewshot_match.group(1)) if fewshot_match else ()
+        self._parsed = ParsedCard(full_text=raw.strip(), core=core, modules=modules, begin_dialogs=dialogs)
         self._signature = sig
         return self._parsed
 
     def core_prompt(self) -> str:
         return self._load().core
+
+    def begin_dialogs(self) -> list[str]:
+        return list(self._load().begin_dialogs)
 
     def full_text(self) -> str:
         return self._load().full_text

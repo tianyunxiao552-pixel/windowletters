@@ -14,10 +14,12 @@ def pick_display_name(item: dict) -> str:
 
 
 class MemberDirectory:
-    def __init__(self, *, ttl_seconds: float = 600.0):
+    def __init__(self, *, ttl_seconds: float = 600.0, failure_backoff_seconds: float = 30.0):
         self.ttl_seconds = ttl_seconds
+        self.failure_backoff_seconds = failure_backoff_seconds
         self._cache: dict[str, dict[str, str]] = {}
         self._fetched_at: dict[str, float] = {}
+        self._failed_at: dict[str, float] = {}
 
     def peek(self, group_id: str, sender_id: str) -> str | None:
         return self._cache.get(group_id, {}).get(sender_id)
@@ -53,24 +55,31 @@ class MemberDirectory:
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
         except Exception:
+            self._failed_at[group_id] = time.monotonic()
             return self.all_cached(group_id)
         if mapping:
             self._cache[group_id] = mapping
             self._fetched_at[group_id] = time.monotonic()
+            self._failed_at.pop(group_id, None)
+        else:
+            self._failed_at[group_id] = time.monotonic()
         return self.all_cached(group_id)
+
+    def _needs_refresh(self, group_id: str) -> bool:
+        now = time.monotonic()
+        if (now - self._failed_at.get(group_id, float("-inf"))) < self.failure_backoff_seconds:
+            return False
+        stale = (now - self._fetched_at.get(group_id, float("-inf"))) >= self.ttl_seconds
+        return stale or (group_id not in self._cache)
 
     async def resolve(self, group_id: str, sender_id: str, client=None) -> str:
         if not sender_id:
             return "群友"
-        now = time.monotonic()
-        stale = (now - self._fetched_at.get(group_id, float("-inf"))) >= self.ttl_seconds
-        if stale or (group_id not in self._cache):
+        if self._needs_refresh(group_id):
             await self.refresh(group_id, client)
         return self._cache.get(group_id, {}).get(sender_id) or sender_id
 
     async def resolve_map(self, group_id: str, client=None) -> dict[str, str]:
-        now = time.monotonic()
-        stale = (now - self._fetched_at.get(group_id, float("-inf"))) >= self.ttl_seconds
-        if stale or (group_id not in self._cache):
+        if self._needs_refresh(group_id):
             await self.refresh(group_id, client)
         return self.all_cached(group_id)

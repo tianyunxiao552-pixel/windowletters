@@ -153,6 +153,8 @@ class OutputFilterTest(unittest.TestCase):
     def test_detects_skip_cleans_markdown_and_splits_bubbles(self):
         mod = load_module("output_filter")
         self.assertTrue(mod.is_skip_reply("[SKIP]"))
+        self.assertTrue(mod.is_skip_reply("对方纯发脏话，触发了规则：直接输出 [SKIP]。 [SKIP]"))
+        self.assertTrue(mod.is_skip_reply("完全触发了规则：不和人吵架"))
         self.assertTrue(mod.is_skip_reply("  【skip】 "))
         self.assertFalse(mod.is_skip_reply("在呢"))
 
@@ -209,6 +211,17 @@ class StyleRagTest(unittest.TestCase):
             self.assertNotIn("25373404", formatted)
             self.assertNotIn("xwt123456", formatted)
             self.assertNotIn("打电话给客服", formatted)
+
+
+class ExampleCardFewshotTest(unittest.TestCase):
+    def test_parses_public_fewshot_begin_dialogs(self):
+        mod = load_module("persona_loader")
+        card = Path(__file__).parents[1] / "瀬尾 依都-人格卡.example.md"
+        loader = mod.PersonaLoader(card)
+        dialogs = loader.begin_dialogs()
+        self.assertEqual(len(dialogs), 4)
+        self.assertEqual(dialogs[1], "在呢")
+        self.assertIn("\n", dialogs[3])
 
 
 if __name__ == "__main__":

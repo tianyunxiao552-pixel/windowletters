@@ -39,7 +39,9 @@ _WORK_ALIASES: dict[str, tuple[str, ...]] = {
     "樱之刻": ("樱之刻",),
     "魔夜": ("魔法使之夜",),
     "魔女审判": ("魔法少女的魔女审判",),
+    "魔裁": ("魔法少女的魔女审判",),
     "边缘行者": ("边缘行者",),
+    "赛博朋克": ("边缘行者", "赛博朋克"),
     "吊带袜": ("吊带袜天使",),
     "异国日记": ("异国日记",),
     "孤独摇滚": ("孤独摇滚",),
@@ -47,6 +49,8 @@ _WORK_ALIASES: dict[str, tuple[str, ...]] = {
     "链锯人": ("链锯人",),
     "电锯人": ("链锯人",),
     "咒术": ("咒术回战",),
+    "死灭回游": ("死灭回游",),
+    "回天": ("回天", "魔法少女小圆"),
     "败犬": ("败犬女主",),
     "春宵": ("春宵苦短",),
     "水母": ("夜晚的水母不会游泳",),
@@ -248,6 +252,7 @@ class PersonalKnowledgeBase:
                 canonical_targets.extend(t.lower() for t in targets)
 
         scored: list[tuple[float, ReviewEntry]] = []
+        q_nums = set(re.findall(r"\d+", q_lower))
         for r in self._reviews:
             t_low = r.title.lower()
             o_low = r.original_title.lower()
@@ -258,7 +263,17 @@ class PersonalKnowledgeBase:
                 score += 9.0
             elif len(o_low) >= 4 and o_low in q_lower:
                 score += 8.0
+            else:
+                # Match shorthand main/subtitle segments (e.g. "赛博朋克2" -> "赛博朋克：边缘行者2")
+                parts = [p.strip() for p in re.split(r"[:：\s·\-—\[\]()（）「」!！?？]+", t_low) if len(p.strip()) >= 3]
+                for seg in parts:
+                    if seg not in _STOP_TITLES and seg in q_lower:
+                        score += 7.5
+                        break
             if score > 0:
+                t_nums = set(re.findall(r"\d+", t_low))
+                if q_nums and t_nums and (q_nums & t_nums):
+                    score += 3.0
                 if r.review:
                     score += 1.5
                 if r.rating is not None:

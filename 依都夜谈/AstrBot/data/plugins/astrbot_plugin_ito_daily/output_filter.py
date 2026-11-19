@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import re
 
-_SKIP_RE = re.compile(r"^\s*[\[【(（]?\s*SKIP\s*[\]】)）]?\s*$", re.I)
+_SKIP_RE = re.compile(r"(?:^|\s)[\[【(（]?\s*SKIP\s*[\]】)）]?(?:\s|[。！!.])*$", re.I)
+_EXPLICIT_SKIP_TOKEN_RE = re.compile(r"[\[【]\s*SKIP\s*[\]】]", re.I)
+_LEAKED_THOUGHT_RE = re.compile(
+    r"(?:完全触发了规则|触发了规则[:：]|直接输出\s*\[?SKIP|不附带任何解释|按照(?:人设|系统提示|规则)|因此我应该(?:保持安静|跳过|输出))",
+    re.I,
+)
 _HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
@@ -14,7 +19,14 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 def is_skip_reply(text: str) -> bool:
-    return bool(text and _SKIP_RE.match(text))
+    """Return True if the model intended to skip or leaked internal rule-checking thoughts."""
+    if not text:
+        return False
+    return bool(
+        _SKIP_RE.match(text)
+        or _EXPLICIT_SKIP_TOKEN_RE.search(text)
+        or _LEAKED_THOUGHT_RE.search(text)
+    )
 
 
 def clean_wechat_text(text: str, *, preserve_structure: bool = False) -> str:
@@ -46,9 +58,9 @@ def split_natural_bubbles(text: str, *, max_bubbles: int = 3) -> list[str]:
             raw_parts = lines
     if len(raw_parts) <= 1:
         return raw_parts
-    # Cap bubble count so we never spam the group.
+    # Cap bubble count so we never spam the group (join tail with double-space so segmented_reply regex [^\n]+ won't re-split).
     if len(raw_parts) > max_bubbles:
         head = raw_parts[: max_bubbles - 1]
-        tail = "\n".join(raw_parts[max_bubbles - 1 :])
+        tail = "  ".join(raw_parts[max_bubbles - 1 :])
         raw_parts = [*head, tail]
     return raw_parts

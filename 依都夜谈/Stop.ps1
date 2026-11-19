@@ -14,12 +14,28 @@ $bridge = $processes | Where-Object {
     $_.CommandLine -like ('*' + $serverConfig + '*')
 }
 
-foreach ($process in (@($astrbot) + @($bridge))) {
+$targets = @()
+if ($astrbot) { $targets += $astrbot }
+if ($bridge) { $targets += $bridge }
+
+foreach ($process in $targets) {
     if (-not $process) { continue }
     try {
-        $terminated = Stop-Process -Id $process.ProcessId -PassThru -ErrorAction Stop
-        $terminated | Wait-Process -Timeout 5 -ErrorAction Stop
-    } catch {
-        if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) { throw }
-    }
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    } catch {}
 }
+
+# Wait briefly until all matched processes actually exit.
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+while ([DateTime]::UtcNow -lt $deadline) {
+    $stillUp = $false
+    foreach ($process in $targets) {
+        if ($process -and (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {
+            $stillUp = $true
+            break
+        }
+    }
+    if (-not $stillUp) { break }
+    Start-Sleep -Milliseconds 100
+}
+if ($stillUp) { throw 'One or more WeChat bot processes did not stop.' }
