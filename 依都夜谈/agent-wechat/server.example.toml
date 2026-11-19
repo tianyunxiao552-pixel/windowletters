@@ -1,0 +1,4 @@
+schemaVersion = 1
+listen = "127.0.0.1:6174"
+dataDir = "data"
+tokenFile = "api-token"

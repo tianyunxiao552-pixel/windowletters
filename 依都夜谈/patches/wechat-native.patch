@@ -1,0 +1,353 @@
+diff --git a/adapter.py b/adapter.py
+index 69855f3..eb542ff 100644
+--- a/adapter.py
++++ b/adapter.py
+@@ -13,9 +13,12 @@ from pathlib import Path
+ 
+ from astrbot.api import logger
+ from astrbot.api.event import MessageChain
+-from astrbot.api.message_components import Plain, Record
++from astrbot.api.message_components import At, Plain, Record
+ from astrbot.api.platform import (
+     AstrBotMessage,
++    Group,
++    MessageMember,
++    MessageType,
+     Platform,
+     PlatformMetadata,
+     register_platform_adapter,
+@@ -43,9 +46,11 @@ from .event import (
+     convert_message,
+     message_timestamp,
+     serialize_chain,
++    session_id,
+     session_target,
+     sticker_preview,
+ )
++from .pat import parse_pat
+ from .friend_requests import FriendRequests
+ from .history_tools import HistoryTools
+ from .loop_guard import LoopGuard
+@@ -231,15 +236,24 @@ class WeChatNativeAdapter(Platform):
+ 
+         if origin != "live":
+             return ignored("origin_not_live")
+-        if raw.get("direction") != "incoming":
+-            return ignored("not_incoming")
+         if raw.get("recall") is not None:
+             return ignored("recalled")
++        cfg = self.native_config
++        thread = raw.get("threadId")
++        if (
++            isinstance(thread, str)
++            and thread.endswith("@chatroom")
++            and cfg.group_reply_mode != "disabled"
++            and (not cfg.allowed_groups or thread in cfg.allowed_groups)
++            and parse_pat(raw, self.bot_self_id) is not None
++        ):
++            return "pat" if self._check_timestamp(raw) else ignored("invalid_timestamp")
++        if raw.get("direction") != "incoming":
++            return ignored("not_incoming")
+         if raw.get("senderId") == self.bot_self_id:
+             return ignored("self_message")
+         if not isinstance(raw.get("senderId"), str) or not raw["senderId"]:
+             return ignored("missing_sender")
+-        cfg = self.native_config
+         msg_type = raw.get("type")
+         if msg_type == 49 and raw.get("appMessageType") in RED_PACKET_APP_TYPES:
+             thread = raw["threadId"]
+@@ -327,11 +341,17 @@ class WeChatNativeAdapter(Platform):
+                 if cfg.group_reply_mode in {"all", "probability"} or mentioned
+                 else ignored("voice_without_mention")
+             )
++        is_quote_self = (
++            is_quote
++            and isinstance(quote, dict)
++            and bool(self.bot_self_id)
++            and quote.get("senderId") == self.bot_self_id
++        )
+         if cfg.enable_media and (
+             is_quoted_image or is_quoted_pdf or is_quoted_voice or is_quoted_sticker
+         ):
+-            return "media" if mentioned else ignored("quoted_media_without_mention")
+-        if cfg.group_reply_mode in {"all", "probability"} or mentioned:
++            return "media" if (mentioned or is_quote_self) else ignored("quoted_media_without_mention")
++        if cfg.group_reply_mode in {"all", "probability"} or mentioned or is_quote_self:
+             return "text"
+         return ignored("group_without_mention")
+ 
+@@ -1013,6 +1033,53 @@ class WeChatNativeAdapter(Platform):
+             ):
+                 await self._reply_to_red_packet(raw)
+             return
++        if kind == "pat":
++            pat_info = parse_pat(raw, self.bot_self_id)
++            fresh = self.state.accept(
++                cursor,
++                message_id,
++                thread,
++                raw.get("serverId"),
++                "queued" if pat_info is not None else "ignored",
++                received=True,
++            )
++            if fresh and pat_info is not None:
++                patter_id = pat_info.sender_id or "pat_sender"
++                patter_name = pat_info.sender_name or patter_id
++                pat_msg = AstrBotMessage()
++                pat_msg.type = MessageType.GROUP_MESSAGE
++                pat_msg.self_id = self.bot_self_id
++                pat_msg.session_id = session_id(
++                    self.native_config.account_id,
++                    thread,
++                    patter_id if self.native_config.unique_session else None,
++                )
++                pat_msg.message_id = message_id
++                pat_msg.sender = MessageMember(user_id=patter_id, nickname=patter_name)
++                pat_msg.group = Group(group_id=thread)
++                pat_msg.message_str = f"（{patter_name}拍了拍你：{pat_info.raw_text}）"
++                pat_msg.message = [At(qq=self.bot_self_id), Plain(pat_msg.message_str)]
++                pat_msg.raw_message = raw
++                pat_msg.timestamp = message_timestamp(raw) or int(time.time())
++                wrapped = WeChatNativeEvent(pat_msg, self)
++                wrapped.set_extra(
++                    "wechat_native_pat",
++                    {
++                        "sender_id": pat_info.sender_id,
++                        "sender_name": pat_info.sender_name,
++                        "target_id": pat_info.target_id,
++                        "raw_text": pat_info.raw_text,
++                    },
++                )
++                try:
++                    self.commit_event(wrapped)
++                except Exception:
++                    self.state.mark_message(message_id, "needs_review")
++                    logger.error("WeChat Native 队列交付失败；消息标识已保留，需人工检查")
++                    raise RuntimeError("Native event handoff requires inspection") from None
++                self._events[message_id] = wrapped
++                logger.debug("WeChat Native 拍一拍已交付 AstrBot：message=%s", message_id)
++            return
+         eligible = kind != "ignore"
+         cacheable = self.native_config.enable_group_summary and self._eligible(
+             raw, origin, summary=True
+diff --git a/loop_guard.py b/loop_guard.py
+index 6d40b45..b904668 100644
+--- a/loop_guard.py
++++ b/loop_guard.py
+@@ -11,13 +11,16 @@ from astrbot.api import logger
+ 
+ WINDOW = 60
+ COOLDOWN = 600
++GROUP_COOLDOWN = 90
++HARD_LIMIT = 8
++GROUP_HARD_LIMIT = 20
+ MAX_THREADS = 1024
+ 
+ 
+ @dataclass
+ class Trace:
+     events: deque = field(default_factory=lambda: deque(maxlen=64))
+-    responses: deque = field(default_factory=lambda: deque(maxlen=8))
++    responses: deque = field(default_factory=lambda: deque(maxlen=24))
+ 
+ 
+ def fingerprint(text):
+@@ -64,10 +67,11 @@ class LoopGuard:
+         return trace
+ 
+     def trip(self, thread, rule):
+-        self.state.set_cooldown(self.account, thread, self.clock() + COOLDOWN)
++        duration = GROUP_COOLDOWN if thread.endswith("@chatroom") else COOLDOWN
++        self.state.set_cooldown(self.account, thread, self.clock() + duration)
+         self.traces.pop(thread, None)
+         digest = hashlib.sha256(f"{self.account}:{thread}".encode()).hexdigest()[:12]
+-        logger.warning("WeChat Native 静默熔断：chat=%s rule=%s window=%s", digest, rule, WINDOW)
++        logger.warning("WeChat Native 静默熔断：chat=%s rule=%s window=%s cooldown=%s", digest, rule, WINDOW, duration)
+ 
+     def incoming(self, thread, message_id, text):
+         trace = self._trace(thread)
+@@ -80,9 +84,13 @@ class LoopGuard:
+         trace = self._trace(thread)
+         if any(row[1] == message_id for row in trace.responses):
+             return
+-        trace.responses.append((self.clock(), message_id))
++        # Multiple segmented bubbles for the same incoming trigger count as one reply.
++        if trigger is not None and any(row[2] == trigger for row in trace.responses):
++            return
++        trace.responses.append((self.clock(), message_id, trigger))
+         trace.events.append((self.clock(), "out", message_id, fingerprint(text), trigger))
+-        if len(trace.responses) >= 8:
++        limit = GROUP_HARD_LIMIT if thread.endswith("@chatroom") else HARD_LIMIT
++        if len(trace.responses) >= limit:
+             self.trip(thread, "hard_limit")
+             return
+         rounds = list(trace.events)[-6:]
+diff --git a/pat.py b/pat.py
+new file mode 100644
+index 0000000..d258b25
+--- /dev/null
++++ b/pat.py
+@@ -0,0 +1,163 @@
++"""Parse WeChat group pat (拍一拍) system and appmsg events."""
++
++from __future__ import annotations
++
++import html
++import re
++import xml.etree.ElementTree as ET
++from dataclasses import dataclass
++
++_TAG_RE = re.compile(r"<[^>]+>")
++_QUOTES = "\"'“”‘’「」『』《》"
++_SELF_INITIATOR_RE = re.compile(r"^(?:你|我)[ 　]*拍了拍")
++_PAT_SPLIT_RE = re.compile(r"^(?P<sender>.*?)\s*(?:拍了拍|tickled)\s*(?P<target>.+)$", re.I)
++
++
++@dataclass(frozen=True)
++class PatEvent:
++    sender_id: str
++    sender_name: str
++    target_id: str
++    target_is_self: bool
++    raw_text: str
++
++
++def _clean_text(value: str) -> str:
++    text = html.unescape(_TAG_RE.sub("", value or ""))
++    return " ".join(text.split()).strip()
++
++
++def _strip_quotes(value: str) -> str:
++    return value.strip().strip(_QUOTES).strip()
++
++
++def _extract_xml_pat(body: str) -> tuple[str, str, str] | None:
++    stripped = body.strip()
++    if "<" not in stripped:
++        return None
++    start = stripped.find("<")
++    xml_text = stripped[start:]
++    try:
++        root = ET.fromstring(xml_text)
++    except ET.ParseError:
++        return None
++
++    # Format 1: <sysmsg type="pat"><pat>...</pat></sysmsg>
++    if root.tag == "sysmsg" and root.attrib.get("type") == "pat":
++        pat = root.find("pat")
++        if pat is None:
++            return None
++        sender = (pat.findtext("fromusername") or "").strip()
++        target = (pat.findtext("pattedusername") or "").strip()
++        template = (pat.findtext("template") or "").strip()
++        return sender, target, template
++
++    # Format 2: <msg><appmsg><type>62</type><patMsg><records><record>...</record></records></patMsg></appmsg></msg>
++    pat_msg = root.find(".//patMsg")
++    if pat_msg is not None:
++        records = pat_msg.findall(".//record")
++        if records:
++            latest = records[-1]
++            sender = (latest.findtext("fromUser") or latest.findtext("fromusername") or "").strip()
++            target = (latest.findtext("pattedUser") or latest.findtext("pattedusername") or "").strip()
++            template = (latest.findtext("template") or "").strip()
++            return sender, target, template
++    return None
++
++
++def _target_matches_self(target_text: str, bot_self_id: str, bot_names: tuple[str, ...]) -> bool:
++    cleaned = _strip_quotes(target_text)
++    if not cleaned:
++        return False
++    if cleaned.startswith("自己"):
++        return False
++    if cleaned == "我" or cleaned.startswith("我的") or cleaned.startswith("我 ") or cleaned.startswith("我，"):
++        return True
++    if bot_self_id and (cleaned == bot_self_id or f"${{{bot_self_id}}}" in target_text):
++        return True
++    for name in bot_names:
++        candidate = name.strip()
++        if not candidate:
++            continue
++        if cleaned == candidate or cleaned.startswith(candidate + "的") or cleaned.startswith(candidate + " "):
++            return True
++    return False
++
++
++def parse_pat(
++    raw: dict,
++    bot_self_id: str = "",
++    *,
++    bot_names: tuple[str, ...] = (),
++) -> PatEvent | None:
++    """Return a PatEvent when ``raw`` is a WeChat pat targeting the bot, else None."""
++    if not isinstance(raw, dict):
++        return None
++    if raw.get("direction") == "outgoing":
++        return None
++    msg_type = raw.get("type")
++    is_pat_type = msg_type in {10000, 10002} or (msg_type == 49 and raw.get("appMessageType") == 62)
++    if not is_pat_type:
++        return None
++
++    body = raw.get("body")
++    if not isinstance(body, str) or not body.strip():
++        return None
++
++    # Try structured XML first (sysmsg type="pat" or appmsg type=62 patMsg).
++    xml_pat = _extract_xml_pat(body)
++    if xml_pat is not None:
++        sender_id, target_id, template = xml_pat
++        if bot_self_id and sender_id == bot_self_id:
++            return None
++        target_is_self = bool(bot_self_id and target_id == bot_self_id)
++        if not target_is_self and template:
++            # Fallback to template text if target_id was absent.
++            plain_tpl = _clean_text(template)
++            match = _PAT_SPLIT_RE.match(plain_tpl)
++            if match and _target_matches_self(match.group("target"), bot_self_id, bot_names):
++                target_is_self = True
++        if not target_is_self:
++            return None
++        readable = _clean_text(template) or "拍了拍你"
++        sender_name = ""
++        match = _PAT_SPLIT_RE.match(readable)
++        if match:
++            candidate = _strip_quotes(match.group("sender"))
++            if candidate and not candidate.startswith("${"):
++                sender_name = candidate
++        return PatEvent(
++            sender_id=sender_id or (raw.get("senderId") if isinstance(raw.get("senderId"), str) else ""),
++            sender_name=sender_name,
++            target_id=target_id or bot_self_id,
++            target_is_self=True,
++            raw_text=readable,
++        )
++
++    # Fallback: plain or HTML-link system message text (type 10000/10002).
++    plain = _clean_text(body)
++    if not plain or ("拍了拍" not in plain and "tickled" not in plain.lower()):
++        return None
++    if _SELF_INITIATOR_RE.match(_strip_quotes(plain)):
++        return None
++    match = _PAT_SPLIT_RE.match(plain)
++    if not match:
++        return None
++    sender_name = _strip_quotes(match.group("sender"))
++    target_text = match.group("target").strip()
++    if sender_name in {"你", "我"}:
++        return None
++    if not _target_matches_self(target_text, bot_self_id, bot_names):
++        return None
++
++    raw_sender = raw.get("senderId")
++    sender_id = raw_sender if isinstance(raw_sender, str) and not raw_sender.endswith("@chatroom") else ""
++    if bot_self_id and sender_id == bot_self_id:
++        return None
++    return PatEvent(
++        sender_id=sender_id,
++        sender_name=sender_name,
++        target_id=bot_self_id,
++        target_is_self=True,
++        raw_text=plain,
++    )

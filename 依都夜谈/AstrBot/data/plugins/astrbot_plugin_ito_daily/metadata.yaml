@@ -1,0 +1,6 @@
+name: astrbot_plugin_ito_daily
+display_name: 窗边来信 · 依都
+desc: 在指定微信群支持 @、引用回复、拍一拍与智能主动接话，维护群聊实时上下文/记忆/万字人格卡热同步，并于北京时间 23:00 自动发送群聊小结。
+version: 0.3.0
+author: Local
+repo: ""

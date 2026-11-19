@@ -1,15 +1,15 @@
 # Third-party installations and private runtime data
-AstrBot/*
-!AstrBot/data/
-AstrBot/data/*
-!AstrBot/data/plugins/
+/萤火来声/AstrBot/*
+!/萤火来声/AstrBot/data/
+/萤火来声/AstrBot/data/*
+!/萤火来声/AstrBot/data/plugins/
 NapCat/
 GPT-SoVITS/
 GPT-SoVITS-*/
 qq-data/
-runtime/*
-!runtime/*.example.json
-!runtime/*.example.yaml
+/萤火来声/runtime/*
+!/萤火来声/runtime/*.example.json
+!/萤火来声/runtime/*.example.yaml
 logs/
 __pycache__/
 *.py[cod]
@@ -31,3 +31,21 @@ node_modules/
 *.flac
 *.ogg
 *.m4a
+/依都夜谈/AstrBot/*
+!/依都夜谈/AstrBot/data/
+/依都夜谈/AstrBot/data/*
+!/依都夜谈/AstrBot/data/plugins/
+/依都夜谈/AstrBot/data/plugins/*
+!/依都夜谈/AstrBot/data/plugins/astrbot_plugin_ito_daily/
+/依都夜谈/agent-wechat/*
+!/依都夜谈/agent-wechat/server.example.toml
+/依都夜谈/dashboard/
+/依都夜谈/近日小结/
+/依都夜谈/日报目标.json
+/依都夜谈/瀬尾 依都-人格卡.md
+/拾信/exports/
+/句读工坊/自动生成/
+/自画像/查看个人信息库.html
+/自画像/个人信息补充汇总.md
+*.exe
+*.dll

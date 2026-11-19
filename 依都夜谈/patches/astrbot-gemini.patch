@@ -1,0 +1,256 @@
+diff --git a/astrbot/core/provider/sources/gemini_source.py b/astrbot/core/provider/sources/gemini_source.py
+index 0d8df6a..21714ed 100644
+--- a/astrbot/core/provider/sources/gemini_source.py
++++ b/astrbot/core/provider/sources/gemini_source.py
+@@ -3,7 +3,7 @@ import base64
+ import json
+ import logging
+ import random
+-from collections.abc import AsyncGenerator
++from collections.abc import AsyncGenerator, Generator
+ from contextlib import asynccontextmanager
+ from typing import Literal, cast
+ 
+@@ -41,6 +41,36 @@ class SuppressNonTextPartsWarning(logging.Filter):
+ logging.getLogger("google_genai.types").addFilter(SuppressNonTextPartsWarning())
+ 
+ 
++class GeminiFreeFirstAuth(httpx.Auth):
++    """Use the paid key when free-tier generation is rate-limited or unavailable."""
++
++    def __init__(self, paid_key: str) -> None:
++        self.paid_key = paid_key
++
++    def auth_flow(
++        self, request: httpx.Request
++    ) -> Generator[httpx.Request, httpx.Response, None]:
++        response = yield request
++        operation = request.url.path.rpartition(":")[2]
++        if response.status_code in {429, 503} and operation in {
++            "generateContent",
++            "streamGenerateContent",
++        }:
++            logger.info(
++                "Gemini free-tier request returned HTTP %s. Trying the paid fallback.",
++                response.status_code,
++            )
++            headers = request.headers.copy()
++            headers["x-goog-api-key"] = self.paid_key
++            yield httpx.Request(
++                request.method,
++                request.url,
++                headers=headers,
++                content=request.content,
++                extensions=request.extensions,
++            )
++
++
+ @register_provider_adapter(
+     "googlegenai_chat_completion",
+     "Google Gemini Chat Completion 提供商适配器",
+@@ -99,6 +129,18 @@ class ProviderGoogleGenAI(Provider):
+             "base_url": self.api_base,
+             "timeout": self.timeout,
+         }
++        if self.provider_config.get("gm_rate_limit_fallback"):
++            if (
++                len(self.api_keys) != 2
++                or not all(
++                    isinstance(key, str) and key.strip() for key in self.api_keys
++                )
++                or self.api_keys[0] == self.api_keys[1]
++            ):
++                raise ValueError(
++                    "Gemini rate-limit fallback requires distinct free and paid keys."
++                )
++            async_client_kwargs["auth"] = GeminiFreeFirstAuth(self.api_keys[1])
+         if proxy:
+             async_client_kwargs["proxy"] = proxy
+             async_client_kwargs["trust_env"] = False
+@@ -174,7 +216,9 @@ class ProviderGoogleGenAI(Provider):
+         if e.message is None:
+             e.message = ""
+ 
+-        if e.code == 429 or "API key not valid" in e.message:
++        if not self.provider_config.get("gm_rate_limit_fallback") and (
++            e.code == 429 or "API key not valid" in e.message
++        ):
+             keys.remove(self.chosen_api_key)
+             if len(keys) > 0:
+                 self.set_key(random.choice(keys))
+@@ -719,6 +763,9 @@ class ProviderGoogleGenAI(Provider):
+                             contents=cast(types.ContentListUnion, conversation),
+                             config=config,
+                         ),
++                        retry_rate_limits=not self.provider_config.get(
++                            "gm_rate_limit_fallback"
++                        ),
+                         max_attempts=request_max_retries,
+                     )
+                 logger.debug(f"genai result: {result}")
+@@ -814,6 +861,9 @@ class ProviderGoogleGenAI(Provider):
+                             contents=cast(types.ContentListUnion, conversation),
+                             config=config,
+                         ),
++                        retry_rate_limits=not self.provider_config.get(
++                            "gm_rate_limit_fallback"
++                        ),
+                         max_attempts=request_max_retries,
+                     )
+                 break
+diff --git a/tests/test_gemini_source.py b/tests/test_gemini_source.py
+index 3e54990..35fca99 100644
+--- a/tests/test_gemini_source.py
++++ b/tests/test_gemini_source.py
+@@ -1,3 +1,4 @@
++import json
+ from types import SimpleNamespace
+ 
+ import httpx
+@@ -296,7 +297,9 @@ async def _drain_gemini_stream(provider, monkeypatch, chunks):
+         for chunk in chunks:
+             yield chunk
+ 
+-    async def fake_retry(provider_name, request_factory, max_attempts=None):
++    async def fake_retry(
++        provider_name, request_factory, max_attempts=None, *, retry_rate_limits=True
++    ):
+         return fake_stream()
+ 
+     monkeypatch.setattr(gemini_source, "retry_provider_request", fake_retry)
+@@ -364,7 +367,9 @@ async def test_gemini_stream_keeps_conversation_header_until_consumed(
+         observed_headers.append(headers.get("x-astrbot-conversation-id"))
+         yield _gemini_stream_chunk(text="ok")
+ 
+-    async def fake_retry(provider_name, request_factory, max_attempts=None):
++    async def fake_retry(
++        provider_name, request_factory, max_attempts=None, *, retry_rate_limits=True
++    ):
+         return fake_stream()
+ 
+     monkeypatch.setattr(gemini_source, "retry_provider_request", fake_retry)
+@@ -407,3 +412,124 @@ async def test_gemini_stream_keeps_reasoning_from_tool_call_chunk(monkeypatch):
+ 
+     final = responses[-1]
+     assert final.reasoning_content == "weighing optionsdeciding to call"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("free_error", [429, 503])
++async def test_gemini_free_fallback_is_per_request(monkeypatch, stream, free_error):
++    requests = []
++    limited = True
++    completion = {
++        "candidates": [
++            {
++                "content": {"role": "model", "parts": [{"text": "在呢"}]},
++                "finishReason": "STOP",
++            }
++        ],
++    }
++
++    def respond(request):
++        key = request.headers["x-goog-api-key"]
++        requests.append((key, request.content))
++        if key == "free-test-key" and limited:
++            return httpx.Response(
++                free_error,
++                json={
++                    "error": {
++                        "code": free_error,
++                        "status": "RESOURCE_EXHAUSTED"
++                        if free_error == 429
++                        else "UNAVAILABLE",
++                    }
++                },
++            )
++        if stream:
++            return httpx.Response(200, text=f"data: {json.dumps(completion)}\n\n")
++        return httpx.Response(200, json=completion)
++
++    original_init = httpx.AsyncClient.__init__
++
++    def mock_client_init(client, *args, **kwargs):
++        original_init(client, *args, **kwargs, transport=httpx.MockTransport(respond))
++
++    monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_client_init)
++    provider = ProviderGoogleGenAI(
++        {
++            "id": "gemini_quota_test",
++            "api_base": "https://generativelanguage.googleapis.com/",
++            "model": "gemini-3.8-flash",
++            "key": ["free-test-key", "paid-test-key"],
++            "gm_rate_limit_fallback": True,
++        },
++        {},
++    )
++
++    async def ask():
++        options = {
++            "prompt": "依都在吗",
++            "system_prompt": "你叫依都",
++            "request_max_retries": 1,
++        }
++        if stream:
++            responses = [
++                response async for response in provider.text_chat_stream(**options)
++            ]
++            return responses[-1].completion_text
++        return (await provider.text_chat(**options)).completion_text
++
++    try:
++        assert await ask() == "在呢"
++        limited = False
++        assert await ask() == "在呢"
++    finally:
++        await provider.terminate()
++
++    assert [key for key, _ in requests] == [
++        "free-test-key",
++        "paid-test-key",
++        "free-test-key",
++    ]
++    assert requests[0][1] == requests[1][1]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("status_code", "message"), [(400, "API key not valid"), (502, "Bad gateway")]
++)
++async def test_gemini_other_errors_never_use_paid_key(
++    monkeypatch, status_code, message
++):
++    used_keys = []
++
++    def respond(request):
++        key = request.headers["x-goog-api-key"]
++        used_keys.append(key)
++        return httpx.Response(
++            status_code,
++            json={"error": {"code": status_code, "message": message}},
++        )
++
++    original_init = httpx.AsyncClient.__init__
++
++    def mock_client_init(client, *args, **kwargs):
++        original_init(client, *args, **kwargs, transport=httpx.MockTransport(respond))
++
++    monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_client_init)
++    provider = ProviderGoogleGenAI(
++        {
++            "id": "gemini_quota_test",
++            "api_base": "https://generativelanguage.googleapis.com/",
++            "model": "gemini-3.8-flash",
++            "key": ["free-test-key", "paid-test-key"],
++            "gm_rate_limit_fallback": True,
++        },
++        {},
++    )
++    try:
++        with pytest.raises(gemini_source.APIError) as err:
++            await provider.text_chat(prompt="依都在吗", request_max_retries=1)
++        assert err.value.code == status_code
++    finally:
++        await provider.terminate()
++    assert used_keys == ["free-test-key"]
