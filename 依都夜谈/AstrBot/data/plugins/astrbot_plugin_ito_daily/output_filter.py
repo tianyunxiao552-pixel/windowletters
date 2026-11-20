@@ -43,24 +43,24 @@ def clean_wechat_text(text: str, *, preserve_structure: bool = False) -> str:
     return cleaned.strip()
 
 
-def split_natural_bubbles(text: str, *, max_bubbles: int = 3) -> list[str]:
-    """Split multi-paragraph casual chat replies into 1-3 natural WeChat bubbles."""
+def split_natural_bubbles(text: str, *, max_bubbles: int = 2) -> list[str]:
+    """Split multi-line casual chat replies into at most max_bubbles WeChat bubbles without leaking extra newlines."""
     cleaned = text.strip()
     if not cleaned:
         return []
-    # Keep structured multi-line blocks (e.g., daily summaries or step lists) as a single message.
+    # Keep structured multi-line blocks (e.g., daily summaries or long requested analyses) as a single message.
     if any(marker in cleaned for marker in ("【", "▌", "✦")) or len(cleaned) > 220:
         return [cleaned]
     raw_parts = [p.strip() for p in re.split(r"\n{2,}", cleaned) if p.strip()]
     if len(raw_parts) == 1 and "\n" in raw_parts[0]:
-        lines = [line.strip() for line in raw_parts[0].split("\n") if line.strip()]
-        if 2 <= len(lines) <= max_bubbles:
-            raw_parts = lines
-    if len(raw_parts) <= 1:
-        return raw_parts
-    # Cap bubble count so we never spam the group (join tail with double-space so segmented_reply regex [^\n]+ won't re-split).
-    if len(raw_parts) > max_bubbles:
-        head = raw_parts[: max_bubbles - 1]
-        tail = "  ".join(raw_parts[max_bubbles - 1 :])
-        raw_parts = [*head, tail]
-    return raw_parts
+        raw_parts = [line.strip() for line in raw_parts[0].split("\n") if line.strip()]
+    # Flatten any internal single newlines inside parts so segmented_reply regex [^\n]+ never re-splits beyond max_bubbles.
+    flat_parts = ["  ".join(ln.strip() for ln in p.splitlines() if ln.strip()) for p in raw_parts]
+    flat_parts = [p for p in flat_parts if p]
+    if len(flat_parts) <= 1:
+        return flat_parts
+    if len(flat_parts) > max_bubbles:
+        head = flat_parts[: max_bubbles - 1]
+        tail = "  ".join(flat_parts[max_bubbles - 1 :])
+        return [*head, tail]
+    return flat_parts

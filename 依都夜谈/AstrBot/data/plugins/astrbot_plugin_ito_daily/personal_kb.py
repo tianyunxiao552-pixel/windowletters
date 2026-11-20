@@ -83,10 +83,114 @@ _WORK_ALIASES: dict[str, tuple[str, ...]] = {
 
 _STOP_TITLES = frozenset({"三体", "游戏", "动画", "音乐", "书籍", "日常", "电影", "剧情"})
 
+# Common variant / traditional / homophone-typo pairs so a 1-char slip (e.g. 熏 vs 薰) never misses.
+_VARIANT_TRANSLATION = str.maketrans(
+    {
+        "熏": "薰",
+        "凜": "凛",
+        "涼": "凉",
+        "詠": "咏",
+        "櫻": "樱",
+        "劍": "剑",
+        "戀": "恋",
+        "夢": "梦",
+        "聲": "声",
+        "國": "国",
+        "樂": "乐",
+        "無": "无",
+        "風": "风",
+        "愛": "爱",
+        "戰": "战",
+        "機": "机",
+        "龍": "龙",
+        "馬": "马",
+        "鳥": "鸟",
+        "黒": "黑",
+        "繪": "绘",
+        "學": "学",
+        "園": "园",
+        "華": "华",
+        "麗": "丽",
+        "實": "实",
+        "際": "际",
+        "時": "时",
+        "間": "间",
+        "與": "与",
+        "為": "为",
+        "說": "说",
+        "話": "话",
+        "語": "语",
+        "紀": "纪",
+        "記": "记",
+        "錄": "录",
+        "響": "响",
+        "戲": "戏",
+        "劇": "剧",
+        "號": "号",
+        "點": "点",
+        "線": "线",
+        "邊": "边",
+        "緣": "缘",
+        "異": "异",
+        "體": "体",
+    }
+)
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_UNSEEN_WORK_PATTERNS = (
+    re.compile(r"《([^《》\n]{2,24})》"),
+    re.compile(
+        r"(?:评价一下|锐评一下|说说(?:你对|我对|对)|怎么看|觉得|看过|读过|推过|玩过)\s*([^\s，。！？,.!?:：()（）]{2,18})(?:吗|没|没有|的评价|怎么样|咋样|好看吗|好玩吗|写得怎么样|如何)?"
+    ),
+)
+_UNSEEN_NON_WORK_WORDS = (
+    "这个",
+    "那个",
+    "一下",
+    "什么",
+    "怎么",
+    "今天",
+    "刚才",
+    "最近",
+    "现在",
+    "群里",
+    "群友",
+    "大家",
+    "自己",
+    "我们",
+    "你们",
+    "他们",
+    "模型",
+    "提示词",
+    "人格",
+    "人设",
+    "数据库",
+    "外挂",
+    "机器人",
+    "天气",
+    "游戏",
+    "动画",
+    "番剧",
+    "电影",
+    "小说",
+)
+
+
+def _normalize_text(text: str) -> str:
+    return text.lower().translate(_VARIANT_TRANSLATION)
+
+
+def _cjk_bigrams(text: str) -> set[str]:
+    grams: set[str] = set()
+    for seg in _CJK_RE.findall(text):
+        for i in range(len(seg) - 1):
+            grams.add(seg[i : i + 2])
+    return grams
+
 
 def _tokenize(text: str) -> Counter[str]:
     counts: Counter[str] = Counter()
-    lower = text.lower()
+    lower = _normalize_text(text)
     for token in _WORD_RE.findall(lower):
         if token.isascii():
             counts[token] += 1
@@ -157,14 +261,11 @@ class PersonalKnowledgeBase:
     def _load(self) -> None:
         if self.path is None or not self.path.is_file():
             return
-        try:
-            conn = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True)
-        except sqlite3.Error:
-            try:
-                conn = sqlite3.connect(self.path)
-            except sqlite3.Error:
-                return
         item_df: Counter[str] = Counter()
+        try:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+        except sqlite3.Error:
+            return
         try:
             cur = conn.cursor()
             for row in cur.execute(
@@ -223,7 +324,7 @@ class PersonalKnowledgeBase:
             conn.close()
 
         # Also load structured supplement markdown bullets alongside the SQLite DB.
-        if self.supplement_path and self.supplement_path.is_file():
+        if self.supplement_path is not None and self.supplement_path.is_file():
             try:
                 section = "个人补充"
                 for raw_line in self.supplement_path.read_text(encoding="utf-8-sig").splitlines():
@@ -245,33 +346,46 @@ class PersonalKnowledgeBase:
         self._item_idf = {t: math.log((n_items + 1) / (f + 1)) + 1.0 for t, f in item_df.items()}
 
     def _match_reviews(self, query: str, *, limit: int = 3) -> list[ReviewEntry]:
-        q_lower = query.lower()
+        q_norm = _normalize_text(query)
+        q_bigrams = _cjk_bigrams(q_norm)
         canonical_targets: list[str] = []
         for alias, targets in _WORK_ALIASES.items():
-            if alias in q_lower:
-                canonical_targets.extend(t.lower() for t in targets)
+            if _normalize_text(alias) in q_norm:
+                canonical_targets.extend(_normalize_text(t) for t in targets)
 
         scored: list[tuple[float, ReviewEntry]] = []
-        q_nums = set(re.findall(r"\d+", q_lower))
+        q_nums = set(re.findall(r"\d+", q_norm))
         for r in self._reviews:
-            t_low = r.title.lower()
-            o_low = r.original_title.lower()
+            t_norm = _normalize_text(r.title)
+            o_norm = _normalize_text(r.original_title)
             score = 0.0
-            if any(ct in t_low or (o_low and ct in o_low) for ct in canonical_targets):
+            if any(ct in t_norm or (o_norm and ct in o_norm) for ct in canonical_targets):
                 score += 10.0
-            elif len(t_low) >= 3 and t_low not in _STOP_TITLES and t_low in q_lower:
+            elif len(t_norm) >= 3 and t_norm not in _STOP_TITLES and t_norm in q_norm:
                 score += 9.0
-            elif len(o_low) >= 4 and o_low in q_lower:
+            elif len(o_norm) >= 4 and o_norm in q_norm:
                 score += 8.0
             else:
                 # Match shorthand main/subtitle segments (e.g. "赛博朋克2" -> "赛博朋克：边缘行者2")
-                parts = [p.strip() for p in re.split(r"[:：\s·\-—\[\]()（）「」!！?？]+", t_low) if len(p.strip()) >= 3]
+                parts = [
+                    p.strip()
+                    for p in re.split(r"[:：\s·\-—\[\]()（）「」!！?？]+", t_norm)
+                    if len(p.strip()) >= 3
+                ]
                 for seg in parts:
-                    if seg not in _STOP_TITLES and seg in q_lower:
+                    if seg not in _STOP_TITLES and seg in q_norm:
                         score += 7.5
                         break
+                # Typo-tolerant CJK bigram overlap fallback for >= 4-char titles
+                if score == 0.0 and q_bigrams:
+                    t_grams = _cjk_bigrams(t_norm)
+                    if len(t_grams) >= 3:
+                        overlap = len(t_grams & q_bigrams)
+                        ratio = overlap / len(t_grams)
+                        if overlap >= 3 and ratio >= 0.65:
+                            score += 6.0 + ratio * 2.0
             if score > 0:
-                t_nums = set(re.findall(r"\d+", t_low))
+                t_nums = set(re.findall(r"\d+", t_norm))
                 if q_nums and t_nums and (q_nums & t_nums):
                     score += 3.0
                 if r.review:
@@ -290,6 +404,25 @@ class PersonalKnowledgeBase:
             if len(picked) >= limit:
                 break
         return picked
+
+    def detect_unseen_work_query(self, message_text: str) -> str | None:
+        """If the user explicitly asks about a work not found in personal DB, return a grounded negative cue."""
+        cleaned = (message_text or "").strip()
+        if len(cleaned) < 4:
+            return None
+        candidate = ""
+        for pat in _UNSEEN_WORK_PATTERNS:
+            m = pat.search(cleaned)
+            if m:
+                candidate = m.group(1).strip("《》「」\"' ")
+                break
+        if not candidate or len(candidate) < 2:
+            return None
+        if any(w in candidate for w in _UNSEEN_NON_WORK_WORDS):
+            return None
+        if self.query_for_prompt(candidate, max_chars=200):
+            return None
+        return f"个人记忆库未收录《{candidate}》（无你的观看/阅读或评分记录）；若对方问你的观后感或是否看过，如实说没看过或没读过。"
 
     def _match_posts(self, query: str, *, limit: int = 2) -> list[PostEntry]:
         q_lower = query.lower()

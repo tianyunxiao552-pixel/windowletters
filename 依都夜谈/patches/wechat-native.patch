@@ -1,5 +1,5 @@
 diff --git a/adapter.py b/adapter.py
-index 69855f3..91370c6 100644
+index 69855f3..95b7c26 100644
 --- a/adapter.py
 +++ b/adapter.py
 @@ -13,9 +13,12 @@ from pathlib import Path
@@ -82,13 +82,14 @@ index 69855f3..91370c6 100644
              if not cfg.enable_media:
                  return ignored("media_disabled")
              if body is not None and not isinstance(body, str):
-@@ -307,8 +322,12 @@ class WeChatNativeAdapter(Platform):
+@@ -307,8 +322,14 @@ class WeChatNativeAdapter(Platform):
              return ignored("group_reply_disabled")
          if cfg.allowed_groups and thread not in cfg.allowed_groups:
              return ignored("group_not_allowed")
--        if is_direct_image:
++        if is_direct_sticker:
++            return ignored("direct_group_sticker")
+         if is_direct_image:
 -            return ignored("direct_group_image")
-+        if is_direct_image or is_direct_sticker:
 +            return (
 +                "media"
 +                if cfg.group_reply_mode == "probability"
@@ -97,7 +98,7 @@ index 69855f3..91370c6 100644
          if is_direct_file:
              return ignored("direct_group_file")
          mentions = raw.get("mentions")
-@@ -327,11 +346,17 @@ class WeChatNativeAdapter(Platform):
+@@ -327,11 +348,17 @@ class WeChatNativeAdapter(Platform):
                  if cfg.group_reply_mode in {"all", "probability"} or mentioned
                  else ignored("voice_without_mention")
              )
@@ -117,7 +118,7 @@ index 69855f3..91370c6 100644
              return "text"
          return ignored("group_without_mention")
  
-@@ -660,7 +685,10 @@ class WeChatNativeAdapter(Platform):
+@@ -660,7 +687,10 @@ class WeChatNativeAdapter(Platform):
                  try:
                      async with asyncio.timeout(self.client.media_timeout):
                          if is_sticker:
@@ -129,7 +130,7 @@ index 69855f3..91370c6 100644
                              image_bytes = await asyncio.to_thread(sticker_preview, data)
                          elif is_voice:
                              if is_quote or recent_request:
-@@ -803,6 +831,15 @@ class WeChatNativeAdapter(Platform):
+@@ -803,6 +833,15 @@ class WeChatNativeAdapter(Platform):
                  ):
                      self.state.mark_message(message_id, "no_reply")
                  return
@@ -145,7 +146,7 @@ index 69855f3..91370c6 100644
              try:
                  sent = await self.send_chain(
                      thread,
-@@ -1013,6 +1050,53 @@ class WeChatNativeAdapter(Platform):
+@@ -1013,6 +1052,53 @@ class WeChatNativeAdapter(Platform):
              ):
                  await self._reply_to_red_packet(raw)
              return
@@ -199,7 +200,7 @@ index 69855f3..91370c6 100644
          eligible = kind != "ignore"
          cacheable = self.native_config.enable_group_summary and self._eligible(
              raw, origin, summary=True
-@@ -1065,7 +1149,8 @@ class WeChatNativeAdapter(Platform):
+@@ -1065,7 +1151,8 @@ class WeChatNativeAdapter(Platform):
                  recent_kind
                  or (
                      "sticker"
@@ -475,3 +476,139 @@ index 0000000..d258b25
 +        target_is_self=True,
 +        raw_text=plain,
 +    )
+diff --git a/tests/test_pat_adapter.py b/tests/test_pat_adapter.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_pat_adapter.py
+@@ -0,0 +1,131 @@
++import asyncio
++from datetime import UTC, datetime
++
++import pytest
++
++from astrbot.api.message_components import At
++
++from conftest import module
++
++
++def _now_iso() -> str:
++    return datetime.now(UTC).isoformat()
++
++
++def _make_adapter(tmp_path, **overrides):
++    adapter_mod = module("adapter")
++    cfg = {
++        "id": "ito_wechat",
++        "type": "wechat_native",
++        "enable": True,
++        "server_url": "http://127.0.0.1:6174",
++        "account_id": "acct-1",
++        "token": "example-token",
++        "enable_private_reply": False,
++        "enable_media": True,
++        "group_reply_mode": "probability",
++        "group_reply_style": "plain",
++        "allowed_groups": ["demo-group@chatroom"],
++        "unique_session": False,
++    } | overrides
++    queue = asyncio.Queue()
++    adapter = adapter_mod.WeChatNativeAdapter(cfg, {}, queue, state_dir=tmp_path)
++    adapter.bot_self_id = "wxid_bot"
++    return adapter, queue
++
++
++def test_classify_pat_targeting_bot_in_allowed_group(tmp_path):
++    adapter, _ = _make_adapter(tmp_path)
++    raw = {
++        "id": "m-pat-1",
++        "accountId": "acct-1",
++        "threadId": "demo-group@chatroom",
++        "direction": "system",
++        "type": 10000,
++        "senderId": "",
++        "body": '"阿明" 拍了拍我',
++        "createdAt": _now_iso(),
++        "recall": None,
++    }
++    assert adapter._classify(raw, "live") == "pat"
++
++
++def test_classify_pat_targeting_other_is_ignored(tmp_path):
++    adapter, _ = _make_adapter(tmp_path)
++    raw = {
++        "id": "m-pat-2",
++        "accountId": "acct-1",
++        "threadId": "demo-group@chatroom",
++        "direction": "incoming",
++        "type": 10000,
++        "senderId": "wxid_alice",
++        "body": '"阿明" 拍了拍 "老赵"',
++        "createdAt": _now_iso(),
++        "recall": None,
++    }
++    assert adapter._classify(raw, "live") == "ignore"
++
++
++def test_classify_quote_of_bot_message_in_mention_mode_is_accepted(tmp_path):
++    adapter, _ = _make_adapter(tmp_path, group_reply_mode="mention")
++    raw = {
++        "id": "m-quote-1",
++        "accountId": "acct-1",
++        "threadId": "demo-group@chatroom",
++        "direction": "incoming",
++        "type": 49,
++        "appMessageType": 57,
++        "senderId": "wxid_alice",
++        "body": "这句人味不错",
++        "quote": {
++            "state": "embedded",
++            "type": 1,
++            "senderId": "wxid_bot",
++            "serverId": "srv-1",
++            "embeddedText": "反射弧可以的",
++        },
++        "createdAt": _now_iso(),
++        "recall": None,
++    }
++    assert adapter._classify(raw, "live") == "text"
++
++
++@pytest.mark.asyncio
++async def test_process_pat_event_commits_wake_event_with_metadata(tmp_path):
++    adapter, queue = _make_adapter(tmp_path)
++    raw = {
++        "id": "m-pat-3",
++        "accountId": "acct-1",
++        "threadId": "demo-group@chatroom",
++        "serverId": "srv-pat-3",
++        "direction": "system",
++        "type": 10000,
++        "senderId": "",
++        "body": '"阿明" 拍了拍我的脑袋',
++        "createdAt": _now_iso(),
++        "recall": None,
++    }
++
++    async def fake_message(message_id):
++        assert message_id == "m-pat-3"
++        return raw
++
++    adapter.client.message = fake_message
++    await adapter.process_native_event(
++        {
++            "cursor": "1",
++            "kind": "message.committed",
++            "data": {
++                "messageId": "m-pat-3",
++                "threadId": "demo-group@chatroom",
++                "origin": "live",
++            },
++        }
++    )
++    assert not queue.empty()
++    event = queue.get_nowait()
++    pat_info = event.get_extra("wechat_native_pat")
++    assert pat_info is not None
++    assert pat_info["sender_name"] == "阿明"
++    assert any(isinstance(c, At) and str(c.qq) == "wxid_bot" for c in event.get_messages())
++    await adapter.terminate()

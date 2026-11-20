@@ -1,15 +1,22 @@
-"""Choose group responses across mentions, self-quotes, pats, and smart proactive chat."""
+"""Choose group responses across mentions, owner authority, self-quotes, pats, images, and smart proactive chat."""
 
 from __future__ import annotations
 
 import re
 
-PROACTIVE_CHANCE = 0.27
+PROACTIVE_CHANCE = 0.14
 PROACTIVE_INTERVAL_SECONDS = 300
 PAT_COOLDOWN_SECONDS = 8.0
-IMAGE_COOLDOWN_SECONDS = 15.0
+IMAGE_COOLDOWN_SECONDS = 90.0
+IMAGE_REPLY_CHANCE = 0.45
 QUOTE_SELF_BURST_LIMIT = 2
 QUOTE_SELF_WINDOW_SECONDS = 90.0
+BURST_MESSAGE_LIMIT = 5
+FOLLOWUP_WINDOW_SECONDS = 45.0
+FOLLOWUP_MAX_TURNS = 1
+GATE_SCAN_COOLDOWN_SECONDS = 45.0
+GATE_MIN_NEW_MESSAGES = 2
+GATE_MIN_SINGLE_CHARS = 16
 
 _SEVERE_ABUSE_WORDS = (
     "臭婊子",
@@ -114,26 +121,70 @@ def select_reply(
     recent_quote_count: int = 0,
     has_image: bool = False,
     since_last_image: float = float("inf"),
+    image_roll: float | None = None,
+    recent_burst_count: int = 0,
+    duplicate_recent_image: bool = False,
+    is_owner: bool = False,
+    is_recent_reply_target: bool = False,
+    since_bot_replied_sender: float = float("inf"),
+    followup_count: int = 0,
+    is_quoting_other: bool = False,
+    use_smart_gate: bool = False,
+    since_last_gate_scan: float = float("inf"),
+    new_msgs_since_scan: int = 0,
 ) -> str:
+    # Owner explicit wake (@mention or quoting bot) bypasses hostile-bait & burst caps.
+    if is_owner and mentioned:
+        return "mention"
+    if is_owner and quoted_self:
+        return "quote_self"
+
     if text and is_hostile_bait_text(text):
         return "ignore"
     if mentioned:
+        if duplicate_recent_image and not (text and text.strip() and text.strip() != "[图片]"):
+            return "ignore"
         return "mention"
     if quoted_self:
-        if text and is_hostile_bait_text(text):
-            return "ignore"
         if recent_quote_count >= QUOTE_SELF_BURST_LIMIT:
             return "ignore"
         return "quote_self"
     if patted_self:
         return "pat" if since_last_pat >= PAT_COOLDOWN_SECONDS else "ignore"
-    if has_image:
-        return "image" if since_last_image >= IMAGE_COOLDOWN_SECONDS else "ignore"
     if (
-        has_plain_text
-        and since_last >= PROACTIVE_INTERVAL_SECONDS
-        and roll < PROACTIVE_CHANCE
+        is_recent_reply_target
+        and has_plain_text
+        and not has_image
+        and not is_quoting_other
+        and since_bot_replied_sender <= FOLLOWUP_WINDOW_SECONDS
+        and followup_count < FOLLOWUP_MAX_TURNS
         and (text is None or not is_low_signal_text(text))
     ):
+        return "followup"
+    if has_image:
+        if duplicate_recent_image:
+            return "ignore"
+        if recent_burst_count >= BURST_MESSAGE_LIMIT:
+            return "ignore"
+        chance_roll = roll if image_roll is None else image_roll
+        if since_last_image >= IMAGE_COOLDOWN_SECONDS and chance_roll < IMAGE_REPLY_CHANCE:
+            return "image"
+        return "ignore"
+    if not has_plain_text:
+        return "ignore"
+    if recent_burst_count >= BURST_MESSAGE_LIMIT:
+        return "ignore"
+    if text is not None and is_low_signal_text(text):
+        return "ignore"
+    if since_last < PROACTIVE_INTERVAL_SECONDS:
+        return "ignore"
+    if use_smart_gate:
+        enough_signal = new_msgs_since_scan >= GATE_MIN_NEW_MESSAGES or (
+            text is not None and len(text.strip()) >= GATE_MIN_SINGLE_CHARS
+        )
+        if since_last_gate_scan >= GATE_SCAN_COOLDOWN_SECONDS and enough_signal:
+            return "gate_check"
+        return "ignore"
+    if roll < PROACTIVE_CHANCE:
         return "proactive"
     return "ignore"

@@ -12,4 +12,8 @@
 
 本地资料可选。风格样本用环境变量 `ITO_STYLE_CORPUS_DIR`，见[句读工坊](../句读工坊/)。个人资料用 `ITO_PERSONAL_KB_PATH`，见[自画像](../自画像/)。命中的资料片段会进入模型上下文。
 
+要给固定成员设置互动风格，把 `依都关系.example.json` 复制为 `依都关系.json`，填 `group_id`、本人微信 ID `owner_wxid`，以及可选的 `member_defaults`。后者用微信 ID 作为键，值可包含 `name`、`familiarity`、`affinity`、`banter_level` 和 `banter_cap`。群消息范围由 AstrBot 群白名单控制。指定本人账号后，符合筛选条件的本人发言会作为额外风格样本保存在本机 `plugin_data`。
+
+主动接话判断可用 `google_gemini_free` 来源的 Key，按需查证公开事实用 `google_gemini` 来源。两者使用代码中配置的 Gemini Flash-Lite 辅助模型。启用互动和日报记忆整理时，在 AstrBot 里添加 ID 为 `gemini_ito_lite` 的模型。主聊天使用会话里选定的模型。
+
 补丁基线是 AstrBot `f61a7f42696da6df25dc7a249ec9b8d54ed9da18` 和 WeChat Native `a005b5ad5ff3897aaf44c41f256b99ed66d0f2cd`，分别沿用 [AGPL-3.0](patches/ASTRBOT-AGPL-3.0.txt) 和 [MIT](patches/WECHAT-NATIVE-MIT.txt)。

@@ -1,4 +1,4 @@
-"""Zero-dependency weighted, anti-aggression style retriever over sanitized real chat corpus."""
+"""Zero-dependency weighted, banter-routed style retriever over sanitized real chat corpus."""
 
 from __future__ import annotations
 
@@ -47,6 +47,49 @@ _AGGRESSIVE_KEYWORDS = (
     "去亖",
     "有攻击性",
 )
+_WITTY_MARKERS = (
+    "🤣",
+    "难绷",
+    "何意味",
+    "逆天",
+    "绷不住",
+    "离谱",
+    "笑死",
+    "sota",
+    "gap",
+    "战备",
+    "虫豸",
+    "鱼腩",
+    "野人",
+    "典中典",
+    "经典",
+    "神了",
+    "乐死",
+    "幽默",
+    "卧龙",
+    "抽象",
+)
+_META_NOISE_KEYWORDS = (
+    "审查模型",
+    "（审查",
+    "(审查",
+    "人机闭嘴",
+    "外挂数据库",
+    "系统提示词",
+    "system prompt",
+    "好感度",
+    "人际模块",
+    "停服维护",
+    "引用才回",
+    "不引用没用",
+    "依旧没有引用",
+    "后台",
+    "token",
+    "概率",
+    "出来吐槽",
+    "http://",
+    "https://",
+)
 _PRIVACY_RE = re.compile(
     r"(?:\b\d{7,}\b|[A-Za-z]{2,}\d{5,}|身份证|银行卡|手机号|验证码|密码|收件地址|学住费|航财通|xwt\d+)",
     re.I,
@@ -68,6 +111,13 @@ def _tokenize(text: str) -> Counter[str]:
     return counts
 
 
+def _classify_tone(reply_text: str) -> str:
+    lower = reply_text.lower()
+    if any(m in lower for m in _WITTY_MARKERS):
+        return "witty"
+    return "chill"
+
+
 def _is_safe_pair(user_text: str, reply_text: str) -> bool:
     combined = f"{user_text}\n{reply_text}"
     if not reply_text or len(reply_text) < 2 or len(reply_text) > 160:
@@ -83,6 +133,23 @@ def _is_safe_pair(user_text: str, reply_text: str) -> bool:
     return True
 
 
+def is_clean_live_owner_utterance(text: str) -> bool:
+    """Return True if an owner group message is clean, non-private, and suitable for live style learning."""
+    cleaned = " ".join((text or "").strip().split())
+    if not (6 <= len(cleaned) <= 100):
+        return False
+    lower = cleaned.lower()
+    if any(k in lower for k in _META_NOISE_KEYWORDS):
+        return False
+    if any(k in cleaned for k in _SPAM_KEYWORDS) or any(k in cleaned for k in _AGGRESSIVE_KEYWORDS):
+        return False
+    if _PRIVACY_RE.search(cleaned):
+        return False
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        return False
+    return True
+
+
 def _compact_user_context(user_text: str) -> str:
     lines = [ln.strip() for ln in user_text.splitlines() if ln.strip() and ln.strip() != "（没有选取前文）"]
     tail = lines[-2:] if lines else []
@@ -92,18 +159,36 @@ def _compact_user_context(user_text: str) -> str:
 
 class StyleCorpusRetriever:
     def __init__(self, sources: list[Path | tuple[Path, float]] | tuple[Path | tuple[Path, float], ...] = ()):
-        self._pairs: list[tuple[str, str, float]] = []
+        # Each item: (compact_user, reply_text, weight, tone)
+        self._pairs: list[tuple[str, str, float, str]] = []
         self._docs: list[Counter[str]] = []
+        self._df: Counter[str] = Counter()
         self._idf: dict[str, float] = {}
+        self._seen_keys: set[str] = set()
         self._load(sources)
 
     @property
     def size(self) -> int:
         return len(self._pairs)
 
+    def _rebuild_idf(self) -> None:
+        total = max(len(self._docs), 1)
+        self._idf = {term: math.log((total + 1) / (freq + 1)) + 1.0 for term, freq in self._df.items()}
+
+    def _add_entry(self, compact_u: str, reply_text: str, weight: float) -> bool:
+        dedup_key = f"{compact_u}||{reply_text}"
+        if dedup_key in self._seen_keys:
+            return False
+        self._seen_keys.add(dedup_key)
+        tone = _classify_tone(reply_text)
+        self._pairs.append((compact_u, reply_text, weight, tone))
+        toks = _tokenize(f"{compact_u} {reply_text}")
+        self._docs.append(toks)
+        for term in toks:
+            self._df[term] += 1
+        return True
+
     def _load(self, sources) -> None:
-        seen_replies: set[str] = set()
-        df: Counter[str] = Counter()
         for entry in sources:
             if isinstance(entry, tuple):
                 p, weight = Path(entry[0]), float(entry[1])
@@ -135,21 +220,43 @@ class StyleCorpusRetriever:
                 ).strip()
                 if not _is_safe_pair(user_text, reply_text):
                     continue
-                compact_u = _compact_user_context(user_text)
-                dedup_key = f"{compact_u}||{reply_text}"
-                if dedup_key in seen_replies:
-                    continue
-                seen_replies.add(dedup_key)
-                self._pairs.append((compact_u, reply_text, weight))
-                toks = _tokenize(f"{compact_u} {reply_text}")
-                self._docs.append(toks)
-                for term in toks:
-                    df[term] += 1
+                self._add_entry(_compact_user_context(user_text), reply_text, weight)
+        self._rebuild_idf()
 
-        total = max(len(self._docs), 1)
-        self._idf = {term: math.log((total + 1) / (freq + 1)) + 1.0 for term, freq in df.items()}
+    def learn_live_sample(
+        self,
+        live_path: Path,
+        *,
+        user_context: str,
+        owner_text: str,
+        weight: float = 1.15,
+    ) -> bool:
+        """Persist and hot-index a new clean utterance from the real owner."""
+        cleaned_reply = " ".join((owner_text or "").strip().split())
+        if not is_clean_live_owner_utterance(cleaned_reply):
+            return False
+        compact_u = _compact_user_context(user_context or "")
+        if not _is_safe_pair(compact_u, cleaned_reply):
+            return False
+        added = self._add_entry(compact_u, cleaned_reply, weight)
+        if not added:
+            return False
+        self._rebuild_idf()
+        record = {
+            "messages": [
+                {"role": "user", "content": compact_u or "（群聊发言）"},
+                {"role": "assistant", "content": cleaned_reply},
+            ]
+        }
+        try:
+            live_path.parent.mkdir(parents=True, exist_ok=True)
+            with live_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        return True
 
-    def retrieve(self, query: str, *, limit: int = 3) -> list[tuple[str, str]]:
+    def retrieve(self, query: str, *, limit: int = 3, banter_level: int = 1) -> list[tuple[str, str]]:
         if not self._pairs or not query.strip():
             return []
         q_toks = _tokenize(query)
@@ -157,33 +264,42 @@ class StyleCorpusRetriever:
             return []
         scored: list[tuple[float, int]] = []
         for idx, doc in enumerate(self._docs):
+            _, reply, weight, tone = self._pairs[idx]
+            if banter_level <= 0 and tone == "witty":
+                continue
             score = 0.0
             for term, q_cnt in q_toks.items():
                 if term in doc:
                     score += self._idf.get(term, 1.0) * min(q_cnt, 2) * (1.0 + math.log(doc[term]))
             if score > 0:
-                _, reply, weight = self._pairs[idx]
                 score *= weight
                 if 4 <= len(reply) <= 45:
                     score *= 1.12
+                if banter_level >= 2 and tone == "witty":
+                    score *= 1.25
+                elif banter_level <= 0 and tone == "chill":
+                    score *= 1.15
                 scored.append((score, idx))
         scored.sort(key=lambda x: x[0], reverse=True)
         picked: list[tuple[str, str]] = []
         seen_text: set[str] = set()
         for _, idx in scored:
-            u, a, _ = self._pairs[idx]
+            u, a, _, _ = self._pairs[idx]
             if a in seen_text:
                 continue
             seen_text.add(a)
             picked.append((u, a))
             if len(picked) >= limit:
                 break
-        # Even on generic queries, anchor the model in the user's real understated rhythm.
         if len(picked) < limit:
             anchors = [
                 (u, a)
-                for u, a, w in self._pairs
-                if w >= 0.75 and 6 <= len(a) <= 48 and a not in seen_text and "http" not in a
+                for u, a, w, tone in self._pairs
+                if w >= 0.75
+                and 6 <= len(a) <= 48
+                and a not in seen_text
+                and "http" not in a
+                and (banter_level > 0 or tone == "chill")
             ]
             if anchors:
                 start = sum(ord(c) for c in query) % len(anchors)
@@ -199,8 +315,8 @@ class StyleCorpusRetriever:
                     tried += 1
         return picked
 
-    def format_for_prompt(self, query: str, *, limit: int = 3) -> str:
-        hits = self.retrieve(query, limit=limit)
+    def format_for_prompt(self, query: str, *, limit: int = 3, banter_level: int = 1) -> str:
+        hits = self.retrieve(query, limit=limit, banter_level=banter_level)
         if not hits:
             return ""
         lines = []
@@ -213,14 +329,25 @@ class StyleCorpusRetriever:
         return "\n".join(lines)
 
 
-def discover_default_corpus(root_dir: Path | None = None) -> list[tuple[Path, float]]:
-    """Load explicitly configured style corpora without scanning private folders."""
+def discover_default_corpus(
+    root_dir: Path | None = None,
+    *,
+    live_corpus_path: Path | None = None,
+) -> list[tuple[Path, float]]:
+    """Load configured labeled corpora and optional live owner utterances."""
+    sources: list[tuple[Path, float]] = []
+    if live_corpus_path is not None and live_corpus_path.is_file():
+        sources.append((live_corpus_path, 1.15))
+
     if root_dir is None:
         configured = os.environ.get("ITO_STYLE_CORPUS_DIR", "").strip()
         if not configured:
-            return []
+            return sources
         root_dir = Path(configured).expanduser()
-    if not root_dir.is_dir():
-        return []
-    sources = {*root_dir.glob("*.jsonl"), *root_dir.glob("*/训练数据.jsonl")}
-    return [(path, 1.0) for path in sorted(sources) if path.is_file()]
+    if root_dir.is_dir():
+        labeled = {*root_dir.glob("*.jsonl"), *root_dir.glob("*/训练数据.jsonl")}
+        sources.extend(
+            (path, 1.0) for path in sorted(labeled)
+            if path.is_file() and path != live_corpus_path
+        )
+    return sources

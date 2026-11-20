@@ -1,4 +1,4 @@
-"""Bounded sliding group-chat context buffer to eliminate context gaps."""
+"""Bounded sliding group-chat context buffer (single source of truth for live group timeline)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 BEIJING = timezone(timedelta(hours=8), "北京时间")
+TOPIC_GAP_SECONDS = 480.0  # Insert a visual topic break after 8+ quiet minutes
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class ChatEntry:
 
 
 class GroupContextBuffer:
-    def __init__(self, *, max_items: int = 36, max_age_seconds: float = 2700.0):
+    def __init__(self, *, max_items: int = 24, max_age_seconds: float = 900.0):
         self.max_items = max_items
         self.max_age_seconds = max_age_seconds
         self._groups: dict[str, deque[ChatEntry]] = {}
@@ -64,7 +65,7 @@ class GroupContextBuffer:
             )
         )
 
-    def recent(self, group_id: str, *, limit: int = 24, now: float | None = None) -> list[ChatEntry]:
+    def recent(self, group_id: str, *, limit: int = 16, now: float | None = None) -> list[ChatEntry]:
         entries = self._groups.get(group_id)
         if not entries:
             return []
@@ -73,14 +74,42 @@ class GroupContextBuffer:
         fresh = [e for e in entries if e.ts >= cutoff]
         return fresh[-limit:]
 
+    def recent_burst_count(
+        self,
+        group_id: str,
+        *,
+        window_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> int:
+        """Count non-bot group messages within the last window_seconds to detect rapid group debates."""
+        entries = self._groups.get(group_id)
+        if not entries:
+            return 0
+        ref = time.time() if now is None else now
+        cutoff = ref - window_seconds
+        return sum(1 for e in entries if not e.is_bot and e.ts >= cutoff)
+
+    def last_human_context(self, group_id: str, *, exclude_sender_id: str = "") -> str:
+        entries = self._groups.get(group_id)
+        if not entries:
+            return ""
+        for entry in reversed(entries):
+            if entry.is_bot:
+                continue
+            if exclude_sender_id and entry.sender_id == exclude_sender_id:
+                continue
+            if entry.text:
+                return f"{entry.sender_name}：{entry.text[:100]}"
+        return ""
+
     def format_context(
         self,
         group_id: str,
         *,
-        limit: int = 22,
+        limit: int = 14,
         now: float | None = None,
         exclude_message_id: str | None = None,
-        max_chars: int = 2400,
+        max_chars: int = 1800,
     ) -> str:
         items = [
             e
@@ -89,19 +118,27 @@ class GroupContextBuffer:
         ][-limit:]
         if not items:
             return ""
-        lines: list[str] = []
+        rendered_items: list[tuple[float, str]] = []
         total = 0
         for entry in reversed(items):
             hhmm = datetime.fromtimestamp(entry.ts, tz=BEIJING).strftime("%H:%M")
             speaker = "依都(你)" if entry.is_bot else entry.sender_name
             quote_part = f" [引用:{entry.quote_text[:60]}]" if entry.quote_text else ""
             line = f"[{hhmm}] {speaker}{quote_part}: {entry.text}"
-            if lines and total + len(line) + 1 > max_chars:
+            if rendered_items and total + len(line) + 1 > max_chars:
                 break
-            lines.append(line)
+            rendered_items.append((entry.ts, line))
             total += len(line) + 1
-        lines.reverse()
-        return "\n".join(lines)
+        rendered_items.reverse()
+        out_lines: list[str] = []
+        prev_ts: float | None = None
+        for ts, line in rendered_items:
+            if prev_ts is not None and (ts - prev_ts) >= TOPIC_GAP_SECONDS:
+                gap_min = max(1, int((ts - prev_ts) // 60))
+                out_lines.append(f"--- 话题间隔约 {gap_min} 分钟 ---")
+            out_lines.append(line)
+            prev_ts = ts
+        return "\n".join(out_lines)
 
     def active_sender_ids(self, group_id: str, *, limit: int = 12, now: float | None = None) -> tuple[str, ...]:
         ids: list[str] = []
@@ -120,6 +157,6 @@ class GroupContextBuffer:
                 continue
             if server_id and entry.server_id and entry.server_id == server_id:
                 return True
-            if norm_text and entry.text and (norm_text == entry.text or norm_text in entry.text or entry.text in norm_text):
+            if norm_text and norm_text in entry.text:
                 return True
         return False
