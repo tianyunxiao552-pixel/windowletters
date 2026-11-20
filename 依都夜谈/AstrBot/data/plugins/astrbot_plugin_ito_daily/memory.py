@@ -50,16 +50,18 @@ def _normalize_profile(raw: dict | None, *, default_name: str = "") -> dict:
 
 def _describe_banter_policy(level: int, *, is_owner: bool = False, quota_cooled: bool = False) -> str:
     if is_owner or level >= 3:
-        return "本体，平视自然聊，直接说真话和想法，不用客套迎合"
+        return "本体与最高权限创建者；平时闲聊平视自然、有话直说，只要他明确下达指令、要求换风格或指定回复方式，优先直接执行不推脱"
     if level <= 0:
+        if quota_cooled:
+            return "熟人，刚才已经调侃过了，接下来几轮正常友善聊，不再抓着同一个点损人"
         return "偏认真敏感，保持平实实在、友善交流，不拿对方战绩或倒霉开玩笑"
     if level == 1:
         if quota_cooled:
-            return "平常熟人，刚才已经开过玩笑了，这轮正常聊点到即止"
-        return "普通熟人，自然松弛聊，偶尔带点轻微生活幽默"
+            return "平常熟人，刚才已经开过玩笑了，这轮正常友善聊，别再带刺"
+        return "普通熟人，平时默认友善轻松聊，偶尔带点温和生活幽默，不无端损人"
     if quota_cooled:
-        return "铁熟人，刚才已经调侃过一轮了，这轮收着点正常接话"
-    return "铁熟人，吃冷幽默和轻度互损，不用客套也不用顺着捧，吐槽点到即止"
+        return "熟人，刚才已经调侃过一轮了，这轮正常友善接话，别再反复损人"
+    return "熟人，平时默认友善自然聊、别人晒成绩或求夸就大方夸；只有遇到明显离谱的梗或对方先开玩笑时才偶尔轻度调侃一句，不无端找茬损人"
 
 
 def _describe_closeness(familiarity: int, affinity: int) -> str:
@@ -81,16 +83,29 @@ def _describe_closeness(familiarity: int, affinity: int) -> str:
 class GroupMemoryStore:
     def __init__(self, file_path: Path):
         self.path = Path(file_path)
+        self._mtime_ns: int = 0
         self._data: dict[str, dict] = self._load()
 
     def _load(self) -> dict[str, dict]:
         if not self.path.is_file():
+            self._mtime_ns = 0
             return {}
         try:
+            self._mtime_ns = self.path.stat().st_mtime_ns
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             return raw if isinstance(raw, dict) else {}
         except (OSError, json.JSONDecodeError):
             return {}
+
+    def _reload_if_changed(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            current_mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            return
+        if current_mtime != self._mtime_ns:
+            self._data = self._load()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,10 +121,15 @@ class GroupMemoryStore:
                 stream.write("\n")
                 stream.close()
                 os.replace(temp, self.path)
+                try:
+                    self._mtime_ns = self.path.stat().st_mtime_ns
+                except OSError:
+                    pass
             finally:
                 temp.unlink(missing_ok=True)
 
     def _group(self, group_id: str) -> dict:
+        self._reload_if_changed()
         bucket = self._data.setdefault(group_id, {"members": {}, "group_facts": []})
         bucket.setdefault("members", {})
         bucket.setdefault("group_facts", [])
@@ -152,6 +172,7 @@ class GroupMemoryStore:
             self._save()
 
     def get_member_profile(self, group_id: str, sender_id: str, *, default_name: str = "") -> dict:
+        self._reload_if_changed()
         bucket = self._data.get(group_id) or {}
         raw = (bucket.get("members") or {}).get(sender_id)
         return _normalize_profile(raw, default_name=default_name or sender_id)
@@ -165,9 +186,9 @@ class GroupMemoryStore:
     ) -> int:
         prof = self.get_member_profile(group_id, sender_id)
         level = min(prof["banter_level"], prof["banter_cap"])
-        # Respect tease quota ("人有嘲讽额度，到了就停"): step down after recent banter.
+        # Respect tease quota ("人有嘲讽额度，到了就停"): cool down cleanly to friendly mode after banter.
         if recent_tease_count >= 1 and 1 <= level <= 2:
-            return level - 1
+            return 0 if recent_tease_count >= 2 else level - 1
         return level
 
     def remember_member(
@@ -319,6 +340,7 @@ class GroupMemoryStore:
         active_sender_ids: tuple[str, ...] = (),
         max_chars: int = 900,
     ) -> str:
+        self._reload_if_changed()
         bucket = self._data.get(group_id)
         if not bucket:
             return ""

@@ -1,0 +1,16 @@
+{
+  "snark_level": 35,
+  "warmth_level": 65,
+  "humor_level": 65,
+  "verbosity": 30,
+  "meme_frequency": 50,
+  "meme_cooldown_sec": 120,
+  "proactive_threshold": 7,
+  "proactive_cooldown_sec": 300,
+  "gate_scan_cooldown_sec": 45,
+  "image_reply_chance": 0.45,
+  "image_cooldown_sec": 90,
+  "followup_window_sec": 45,
+  "tease_cooldown_sec": 600,
+  "owner_directives": []
+}

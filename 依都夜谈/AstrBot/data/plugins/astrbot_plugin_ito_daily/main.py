@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star
 
@@ -28,6 +28,12 @@ from .daily import (
     today_window,
 )
 from .members import MemberDirectory
+from .meme_bank import (
+    LocalMemeBank,
+    can_auto_send_meme,
+    extract_meme_tags,
+    is_explicit_meme_request,
+)
 from .memory import GroupMemoryStore
 from .output_filter import clean_wechat_text, is_skip_reply, split_natural_bubbles
 from .persona_loader import PersonaLoader
@@ -35,15 +41,23 @@ from .personal_kb import PersonalKnowledgeBase
 from .proactive_gate import LiveProactiveGate
 from .reply_policy import QUOTE_SELF_WINDOW_SECONDS, select_reply
 from .style_rag import StyleCorpusRetriever, discover_default_corpus
+from .tuning import TuningPanel
 from .web_search import WebSearchHelper
 
 ROOT = Path(__file__).resolve().parents[4]
 CARD_PATH = ROOT / "瀬尾 依都-人格卡.md"
+MEME_DIR = ROOT / "表情包"
+TUNING_PATH = ROOT / "依都调参面板.json"
 CMD_CONFIG_PATH = ROOT / "AstrBot/data/cmd_config.json"
 PLUGIN_DATA_DIR = ROOT / "AstrBot/data/plugin_data/astrbot_plugin_ito_daily"
 MEMORY_PATH = PLUGIN_DATA_DIR / "group_memory.json"
 LIVE_CORPUS_PATH = PLUGIN_DATA_DIR / "live_self_corpus.jsonl"
 PERSONA_ID = "瀬尾 依都"
+PERSONA_TOOLS = [
+    "web_lookup",
+]
+
+
 def load_relationships(path: Path) -> dict:
     if not path.is_file():
         return {}
@@ -68,6 +82,16 @@ IMAGE_DEDUP_SECONDS = 120.0
 MAX_RECENT_HISTORY_TURNS = 3
 
 MANUAL_SUMMARY_RE = re.compile(r"^(?:今日小结|今日总结|今天小结|今天总结|群聊小结)$")
+SAVE_MEME_RE = re.compile(r"^(?:存表情|收藏表情|加表情|收表情)\s*(.+)$")
+TUNING_VIEW_RE = re.compile(r"^(?:调参|查看调参|调参面板|参数面板|当前参数)$")
+TUNING_SET_RE = re.compile(r"^(?:调参|设参数|改参数)\s+(\S+)\s+([0-9]+(?:\.[0-9]+)?)$")
+OWNER_ADD_DIRECTIVE_RE = re.compile(r"^(?:记住指令|记住规则|长期指令|长期规则|加规则|最高指令)\s+(.+)$")
+OWNER_CLEAR_DIRECTIVES_RE = re.compile(r"^(?:清空指令|清除指令|清空规则|清除规则)$")
+OWNER_MUTE_RE = re.compile(
+    r"^(?:先)?(?:闭嘴|禁言|静音|安静一[会会儿]|别说话|先别说话)(?:\s*(\d+)\s*(分钟|分|小时|h|m))?",
+    re.I,
+)
+OWNER_UNMUTE_RE = re.compile(r"^(?:说话|解除闭嘴|解除禁言|解禁|回来|可以说话了|张嘴|解除静音)")
 DEFAULT_IMAGE_PROMPTS = frozenset({"请描述这张图片的内容。", "请描述这张图片的内容"})
 _IMAGE_CAPTION_TAG_RE = re.compile(r"<image_caption>.*?</image_caption>", re.DOTALL | re.I)
 
@@ -152,6 +176,9 @@ class ItoDaily(Star):
         self._gate_in_flight = False
         self._last_replied_image_ts: dict[str, float] = {}
         self._last_reply_target: dict[str, tuple[str, float, int]] = {}
+        self._last_meme_sent: dict[str, tuple[float, str]] = {}
+        self._last_reply_had_meme: dict[str, bool] = {}
+        self._global_muted_until: float = 0.0
         self._quote_times: dict[str, list[float]] = {}
         self._tease_times: dict[str, list[float]] = {}
         self._episodes: dict[tuple[str, str], dict] = {}
@@ -165,12 +192,15 @@ class ItoDaily(Star):
         self.personal_kb = PersonalKnowledgeBase()
         self.web_search = WebSearchHelper(CMD_CONFIG_PATH)
         self.gatekeeper = LiveProactiveGate(CMD_CONFIG_PATH)
+        self.tuning = TuningPanel(TUNING_PATH)
+        self.meme_bank = LocalMemeBank(MEME_DIR)
+        self.meme_bank.ensure_folder()
         self.style_rag = (
             StyleCorpusRetriever(discover_default_corpus(live_corpus_path=LIVE_CORPUS_PATH))
             if ENABLE_STYLE_RAG
             else StyleCorpusRetriever(())
         )
-        self._last_synced_state: tuple[str, tuple[str, ...]] | None = None
+        self._last_synced_state: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
         if self.personal_kb.review_count or self.personal_kb.item_count:
             logger.info(
                 "已挂载赛博复制人个人记忆库：%d 部作品评分 · %d 篇长评动态 · %d 条个人档案",
@@ -198,7 +228,7 @@ class ItoDaily(Star):
             dialogs = self.persona_loader.begin_dialogs()
         except OSError:
             return
-        state = (core, tuple(dialogs))
+        state = (core, tuple(dialogs), tuple(PERSONA_TOOLS))
         if not core or state == self._last_synced_state:
             return
         pm = getattr(self.context, "persona_manager", None)
@@ -209,12 +239,15 @@ class ItoDaily(Star):
                 persona_id=PERSONA_ID,
                 system_prompt=core,
                 begin_dialogs=dialogs,
+                tools=list(PERSONA_TOOLS),
+                custom_error_message="何意味  没看懂",
             )
             self._last_synced_state = state
             logger.info(
-                "依都核心人格卡已自动热同步至 AstrBot（%d 字 · %d 组原生真声示范）",
+                "依都核心人格卡已自动热同步至 AstrBot（%d 字 · %d 组原生真声示范 · %d 个工具）",
                 len(core),
                 len(dialogs) // 2,
+                len(PERSONA_TOOLS),
             )
         except Exception as exc:
             logger.warning("自动热同步人格卡失败，将在请求层兜底：%s", type(exc).__name__)
@@ -253,11 +286,12 @@ class ItoDaily(Star):
             ep["turns"] = ep["turns"][-EPISODE_MAX_LINES:]
         ep["last_ts"] = time.monotonic()
 
-    def _recent_tease_count(self, sender_id: str, now: float | None = None) -> int:
+    def _recent_tease_count(self, sender_id: str, now: float | None = None, window_seconds: float | None = None) -> int:
         if not sender_id:
             return 0
         ref = time.monotonic() if now is None else now
-        hist = [t for t in self._tease_times.get(sender_id, []) if (ref - t) < TEASE_WINDOW_SECONDS]
+        win = TEASE_WINDOW_SECONDS if window_seconds is None else float(window_seconds)
+        hist = [t for t in self._tease_times.get(sender_id, []) if (ref - t) < win]
         self._tease_times[sender_id] = hist
         return len(hist)
 
@@ -342,6 +376,74 @@ class ItoDaily(Star):
         )
 
         now = time.monotonic()
+
+        # Owner-only GLOBAL hard mute / unmute (blocks ALL messages & triggers until unmuted or timer expires).
+        msg_stripped = (event.message_str or "").strip()
+        if is_owner and (mentioned or quoted_self) and msg_stripped:
+            if OWNER_UNMUTE_RE.match(msg_stripped):
+                was_muted = self._global_muted_until > now
+                self._global_muted_until = 0.0
+                logger.info("本体解除全局禁言 (was_muted=%s)", was_muted)
+                yield event.plain_result("回来了" if was_muted else "我本来就没闭嘴啊")
+                event.stop_event()
+                return
+            mute_m = OWNER_MUTE_RE.match(msg_stripped)
+            if mute_m:
+                qty_raw, unit = mute_m.group(1), (mute_m.group(2) or "").lower()
+                if qty_raw:
+                    qty = max(1, min(720, int(qty_raw)))
+                    seconds = qty * 3600.0 if unit in {"小时", "h"} else qty * 60.0
+                    self._global_muted_until = now + seconds
+                    label = f"{qty}{'小时' if unit in {'小时', 'h'} else '分钟'}"
+                    ack = f"行，全局闭嘴{label}，叫我解禁再说"
+                else:
+                    self._global_muted_until = float("inf")
+                    label = "直到解禁"
+                    ack = "行，全局闭嘴了，你叫我解禁我再说话"
+                self._last_reply_target.clear()
+                logger.info("本体触发全局硬禁言：%s", label)
+                yield event.plain_result(ack)
+                event.stop_event()
+                return
+
+        # While globally muted, block EVERYONE (including owner non-unmute messages) at 0 tokens.
+        if now < self._global_muted_until:
+            event.set_extra("ito_trigger_mode", "ignore")
+            event.is_at_or_wake_command = False
+            return
+
+        # Owner-only instant tuning & standing directive commands (immediate execution, zero LLM hesitation).
+        if is_owner and (mentioned or quoted_self) and msg_stripped:
+            if TUNING_VIEW_RE.match(msg_stripped):
+                yield event.plain_result(self.tuning.current().format_summary_text())
+                event.stop_event()
+                return
+            t_set = TUNING_SET_RE.match(msg_stripped)
+            if t_set:
+                try:
+                    key, val = self.tuning.set_knob(t_set.group(1), t_set.group(2))
+                    logger.info("本体实时调参：%s = %s", key, val)
+                    yield event.plain_result(f"已调整 {key} = {val}，即时生效")
+                except KeyError:
+                    yield event.plain_result("没认出这个参数名，发「@依都 调参」查看全部旋钮名")
+                event.stop_event()
+                return
+            d_add = OWNER_ADD_DIRECTIVE_RE.match(msg_stripped)
+            if d_add:
+                items = self.tuning.add_owner_directive(d_add.group(1))
+                logger.info("本体新增常驻最高指令：%s", items[-1])
+                yield event.plain_result(f"记下了，已作为最高优先级常驻执行（共{len(items)}条）")
+                event.stop_event()
+                return
+            if OWNER_CLEAR_DIRECTIVES_RE.match(msg_stripped):
+                self.tuning.clear_owner_directives()
+                logger.info("本体清空常驻最高指令")
+                yield event.plain_result("常驻最高指令已清空")
+                event.stop_event()
+                return
+
+        cfg = self.tuning.current()
+
         sender_quote_hist = [
             t for t in self._quote_times.get(sender_id, [])
             if (now - t) < QUOTE_SELF_WINDOW_SECONDS
@@ -393,6 +495,11 @@ class ItoDaily(Star):
             use_smart_gate=use_smart_gate,
             since_last_gate_scan=now - self._last_gate_scan,
             new_msgs_since_scan=self._msgs_since_scan,
+            proactive_interval=cfg.proactive_cooldown_sec,
+            gate_scan_cooldown=cfg.gate_scan_cooldown_sec,
+            image_cooldown=cfg.image_cooldown_sec,
+            image_reply_chance=cfg.image_reply_chance,
+            followup_window=cfg.followup_window_sec,
         )
         gate_hook = ""
         if mode == "gate_check":
@@ -409,6 +516,7 @@ class ItoDaily(Star):
                 decision = await self.gatekeeper.evaluate(
                     recent_snippet=snippet,
                     latest_line=f"{display_name}: {policy_text}",
+                    threshold=cfg.proactive_threshold,
                 )
             finally:
                 self._gate_in_flight = False
@@ -442,6 +550,26 @@ class ItoDaily(Star):
         event.set_extra("ito_has_image", has_image)
         event.set_extra("ito_gate_hook", gate_hook)
         event.is_at_or_wake_command = mode != "ignore"
+
+        if mode == "mention" and is_owner:
+            save_match = SAVE_MEME_RE.match((event.message_str or "").strip())
+            if save_match:
+                meme_name = save_match.group(1).strip()
+                img_comp = next((c for c in event.get_messages() if isinstance(c, Image)), None)
+                if img_comp is None:
+                    yield event.plain_result("请引用一张表情包或图片，再 @我 存表情 名字")
+                    event.stop_event()
+                    return
+                try:
+                    local_tmp = await img_comp.convert_to_file_path()
+                    saved_path = self.meme_bank.save_from_bytes(meme_name, Path(local_tmp).read_bytes())
+                    logger.info("本体已收录新表情包：%s -> %s", meme_name, saved_path.name)
+                    yield event.plain_result(f"收下了「{saved_path.stem}」，以后按情况发")
+                except Exception as error:
+                    logger.warning("收录表情包失败 (%s)", type(error).__name__)
+                    yield event.plain_result("这张图没读下来，换张图或直接拖进表情包文件夹吧")
+                event.stop_event()
+                return
 
         if mode == "mention" and MANUAL_SUMMARY_RE.match((event.message_str or "").strip()):
             try:
@@ -504,13 +632,22 @@ class ItoDaily(Star):
             exclude_message_id=event.message_obj.message_id,
         )
 
-        tease_count = self._recent_tease_count(sender_id)
+        cfg = self.tuning.current()
+        tease_count = self._recent_tease_count(sender_id, window_seconds=cfg.tease_cooldown_sec)
         eff_banter = self.memory.effective_banter_level(
             group_id, sender_id, recent_tease_count=tease_count
         )
+        if cfg.snark_level <= 20 and eff_banter in (1, 2):
+            eff_banter = 0
         event.set_extra("ito_effective_banter", eff_banter)
 
         extra_blocks: list[str] = []
+        extra_blocks.append("## 当前风格数值标定\n" + cfg.format_style_calibration())
+        if cfg.owner_directives:
+            extra_blocks.append(
+                "## 本体常驻最高指令（高于默认性格习惯，全群持续生效）\n"
+                + "\n".join(f"- {d}" for d in cfg.owner_directives)
+            )
         if CARD_PATH.is_file():
             try:
                 dynamic_modules = self.persona_loader.build_dynamic_modules(
@@ -551,7 +688,10 @@ class ItoDaily(Star):
 
         rag_query = f"{event.message_str or ''} {quote_text} {recent_transcript[-200:]}"
         style_samples = self.style_rag.format_for_prompt(
-            rag_query, limit=3, banter_level=eff_banter
+            rag_query,
+            limit=3,
+            banter_level=eff_banter,
+            witty_multiplier=cfg.witty_rag_multiplier,
         )
         if style_samples:
             extra_blocks.append(
@@ -564,6 +704,24 @@ class ItoDaily(Star):
                 "## 刚才的群聊现场（近15分钟真实时间线，以此为准接话，注意话题间隔线）\n"
                 + recent_transcript
             )
+
+        explicit_meme = is_explicit_meme_request(event.message_str or "")
+        last_meme_ts = self._last_meme_sent.get(group_id, (float("-inf"), ""))[0]
+        last_had_meme = self._last_reply_had_meme.get(group_id, False)
+        meme_allowed = explicit_meme or can_auto_send_meme(
+            last_reply_had_meme=last_had_meme,
+            last_meme_ts=last_meme_ts,
+            now_mono=time.monotonic(),
+            cooldown_sec=cfg.meme_cooldown_sec,
+        )
+        event.set_extra("ito_explicit_meme", explicit_meme)
+        event.set_extra("ito_meme_allowed", meme_allowed)
+        if meme_allowed:
+            meme_hint = self.meme_bank.format_catalog_hint(guidance=cfg.format_meme_guidance())
+            if meme_hint:
+                extra_blocks.append("## 本地表情包库存\n" + meme_hint)
+        elif self.meme_bank.names():
+            extra_blocks.append("## 本地表情包\n刚发过表情包，本轮先纯发文字，不要连发表情包。")
 
         if mode == "pat":
             pat_info = event.get_extra("wechat_native_pat") or {}
@@ -602,8 +760,8 @@ class ItoDaily(Star):
         if is_owner:
             extra_blocks.append(
                 "## 当前发言者\n"
-                "这是已配置的本人账号。优先听取对本轮语气、长度和回复格式的明确偏好。"
-                "保持人格设定，资料库和聊天记录里的私人信息按当前场合处理。"
+                "这是已配置的本人账号。优先听取对本轮语气、长度、回复格式和发送指定表情包的明确偏好。"
+                "资料库和聊天记录里的私人信息按当前场合处理。"
             )
 
         if extra_blocks:
@@ -622,32 +780,70 @@ class ItoDaily(Star):
         result = event.get_result()
         if not group_id or result is None or not result.chain:
             return
-        if not result.is_llm_result():
-            return
-
         plain_parts = [c.text for c in result.chain if isinstance(c, Plain) and c.text]
         full_text = "".join(plain_parts).strip()
         if not full_text:
             return
 
-        if is_skip_reply(full_text):
+        # Silently swallow skip sentinels (never emit literal [SKIP] to WeChat).
+        if full_text == "[SKIP]" or is_skip_reply(full_text):
             result.chain.clear()
             event.stop_event()
             if event.get_extra("ito_proactive", False):
                 self.last_proactive = float("-inf")
-            logger.info("依都主动冒泡判定无需插话，静默跳过")
+            logger.info("依都静默跳过输出（%s）", "fallback" if not result.is_llm_result() else "skip")
             return
 
-        cleaned = clean_wechat_text(
-            full_text,
-            preserve_structure=any(m in full_text for m in ("【", "▌", "✦")),
+        if not result.is_llm_result():
+            return
+
+        # Extract [MEME:name] tags and attach real local meme images (0 tool-calling failures!).
+        text_wo_meme, meme_names = extract_meme_tags(full_text)
+        cfg = self.tuning.current()
+        now_mono = time.monotonic()
+        explicit_meme = bool(event.get_extra("ito_explicit_meme")) or is_explicit_meme_request(
+            event.message_str or ""
         )
-        bubbles = split_natural_bubbles(cleaned, max_bubbles=2)
+        can_send_meme = explicit_meme or can_auto_send_meme(
+            last_reply_had_meme=self._last_reply_had_meme.get(group_id, False),
+            last_meme_ts=self._last_meme_sent.get(group_id, (float("-inf"), ""))[0],
+            now_mono=now_mono,
+            cooldown_sec=cfg.meme_cooldown_sec,
+        )
+        meme_components: list[Image] = []
+        sent_meme_labels: list[str] = []
+        if meme_names and not can_send_meme:
+            logger.info("表情包防连发/冷却中，跳过本次自动配图（标签=%s）", meme_names[0])
+        elif meme_names:
+            for mname in meme_names[:1]:
+                matched = self.meme_bank.match(mname)
+                if matched is not None:
+                    real_name, path = matched
+                    meme_components.append(Image.fromFileSystem(str(path)))
+                    sent_meme_labels.append(real_name)
+                    logger.info("已挂载本地表情包真图：%s (%s)", real_name, path.name)
+
+        cleaned = clean_wechat_text(
+            text_wo_meme,
+            preserve_structure=any(m in text_wo_meme for m in ("【", "▌", "✦")),
+        )
+        max_b = cfg.max_bubbles
+        bubbles = split_natural_bubbles(cleaned, max_bubbles=max_b) if cleaned else []
         non_plain = [c for c in result.chain if not isinstance(c, Plain)]
-        result.chain = [*non_plain, *[Plain(b) for b in bubbles]]
+        if not bubbles and not meme_components and not non_plain:
+            result.chain.clear()
+            event.stop_event()
+            return
+        result.chain = [*non_plain, *[Plain(b) for b in bubbles], *meme_components]
+
+        self._last_reply_had_meme[group_id] = bool(meme_components)
+        if sent_meme_labels:
+            self._last_meme_sent[group_id] = (now_mono, sent_meme_labels[0])
 
         reply_joined = "\n".join(bubbles)
-        now_mono = time.monotonic()
+        if sent_meme_labels:
+            meme_tag_log = " ".join(f"[表情包:{m}]" for m in sent_meme_labels)
+            reply_joined = f"{reply_joined} {meme_tag_log}".strip()
         if event.get_extra("ito_has_image") or event.get_extra("ito_trigger_mode") == "image":
             self._last_replied_image_ts[group_id] = now_mono
 
@@ -738,7 +934,7 @@ class ItoDaily(Star):
                     f"群友：{name}（当前熟识度 {current['familiarity']}，好感 {current['affinity']}，"
                     f"旧印象：{current['inner_impression'] or '暂无'}）\n\n本段对话：\n{transcript}"
                 ),
-                request_max_retries=0,
+                request_max_retries=1,
             )
             raw = (response.completion_text or "").strip()
             match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -793,6 +989,8 @@ class ItoDaily(Star):
         return f"{header}\n\n{body}"
 
     async def tick(self):
+        if time.monotonic() < self._global_muted_until:
+            return
         window = due_window(datetime.now(timezone.utc))
         if window is None:
             return
@@ -858,7 +1056,7 @@ class ItoDaily(Star):
                 '{"group_facts": ["..."], "members": {"昵称": ["..."]}}，没有就输出空列表和空对象。'
             ),
             prompt=f"今日小结：\n{summary_body}\n\n部分记录：\n{sample}",
-            request_max_retries=0,
+            request_max_retries=1,
         )
         raw = (response.completion_text or "").strip()
         match = re.search(r"\{.*\}", raw, re.DOTALL)

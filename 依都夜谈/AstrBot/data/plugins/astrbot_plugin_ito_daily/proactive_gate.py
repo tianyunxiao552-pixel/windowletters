@@ -110,11 +110,11 @@ class LiveProactiveGate:
             "你是群聊旁观门卫，负责判断熟人群友「依都」此刻有没有必要主动插一句嘴。\n"
             "依都画像：北航理工科、广东人，懂动画/番剧/Gal/单机/影之刃零/LOL/AI模型与工具，爱冷幽默轻吐槽，但绝不强行搭话、不打断别人私事或激烈战术复盘、不对情绪低落/输游戏红温的人拱火。\n"
             "评分标准（0-10）：\n"
-            "- 0~3：普通生活琐事（吃饭/在忙/约人）、纯水字数/表情、私事、或者别人正在认真复盘/点名对话。\n"
+            "- 0~3：普通生活琐事（吃饭/在忙/约人）、纯水字数/表情、私事、别人正在认真复盘，或者明显在问某位群友个人习惯的问题（例如“你玩不玩XX”“你用不用XX”，不要替本人抢答）。\n"
             "- 4~6：有点意思，但依都不说话也完全正常。\n"
-            "- 7~8：明显冒出好玩的反转/神吐槽/离谱笑点，或者正好踩中依都熟悉的番剧、游戏、AI工具话题，顺手接一句很自然出彩。\n"
-            "- 9~10：极高笑点或高度契合依都的梗，不接一句太可惜。\n"
-            '严格只输出一行 JSON：{"score": 0到10整数, "hook": "如果>=7用15字以内写切入点，否则空字符串"}\n\n'
+            "- 7~8：明显冒出好玩的反转/神吐槽/离谱笑点，或者大家公开讨论依都熟悉的番剧、游戏、AI技术/工具问题，顺手接一句很自然出彩。\n"
+            "- 9~10：极高笑点或高度契合依都的公共梗，不接一句太可惜。\n"
+            '严格只输出一行 JSON：{"score": 0到10整数, "hook": "如果>=7用15字以内写纯客观第三人称话题摘要（严禁写第一人称台词，严禁预设依都用过/玩过/看过），否则空字符串"}\n\n'
             f"近期群聊：\n{snippet}\n\n最新一条：\n{latest_line}"
         )
         cfg_kwargs: dict = {
@@ -141,6 +141,7 @@ class LiveProactiveGate:
         recent_snippet: str,
         latest_line: str,
         timeout: float = EVAL_TIMEOUT_SECONDS,
+        threshold: int | None = None,
     ) -> GateDecision:
         now = time.monotonic()
         if self.is_backed_off(now):
@@ -164,4 +165,5 @@ class LiveProactiveGate:
                 self._backoff_until = time.monotonic() + BACKOFF_SECONDS
                 return GateDecision(False, 0, backed_off=True)
             return GateDecision(False, 0)
-        return parse_gate_response(raw, threshold=self.threshold)
+        effective_threshold = self.threshold if threshold is None else max(1, min(10, int(threshold)))
+        return parse_gate_response(raw, threshold=effective_threshold)

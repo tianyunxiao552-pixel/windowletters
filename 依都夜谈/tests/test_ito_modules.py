@@ -136,6 +136,16 @@ class GroupMemoryTest(unittest.TestCase):
             self.assertIn("不拿对方战绩", card)
             self.assertNotIn("群友乙", card)
 
+            # External disk edit is hot-reloaded before subsequent writes (never clobbered)
+            import json, os
+            disk = json.loads(path.read_text(encoding="utf-8"))
+            disk["g1"]["group_facts"] = ["手动更新后的群事实"]
+            path.write_text(json.dumps(disk, ensure_ascii=False), encoding="utf-8")
+            os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 2))
+            store.apply_episode_update("g1", "wxid_member_b", familiarity_delta=1)
+            reloaded = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(reloaded["g1"]["group_facts"], ["手动更新后的群事实"])
+
 
 class PersonaLoaderTest(unittest.TestCase):
     SAMPLE_CARD = """# 瀬尾 依都
@@ -204,6 +214,12 @@ class OutputFilterTest(unittest.TestCase):
         self.assertNotIn("###", cleaned)
         self.assertNotIn("`", cleaned)
 
+        self.assertEqual(mod.clean_wechat_text("血糖爆了属于是"), "血糖爆了")
+        self.assertEqual(mod.clean_wechat_text("我在精神上给你们架枪了属于是"), "我在精神上给你们架枪了")
+        self.assertEqual(mod.clean_wechat_text("天天搁这上演苦情戏是吧"), "天天搁这上演苦情戏")
+        self.assertEqual(mod.clean_wechat_text("明天九点是吧？"), "明天九点是吧？")
+        self.assertEqual(mod.clean_wechat_text("这肯定不是吧"), "这肯定不是吧")
+
         bubbles = mod.split_natural_bubbles("收下了。\n\n不过熬夜到一点多夸我，听着怪可疑的。\n\n赶紧睡吧你。", max_bubbles=3)
         self.assertEqual(len(bubbles), 3)
         self.assertEqual(bubbles[0], "收下了。")
@@ -224,20 +240,20 @@ class StyleRagTest(unittest.TestCase):
             rows = [
                 {
                     "messages": [
-                        {"role": "user", "content": "Rising：qwen4-max怎么还没上"},
+                        {"role": "user", "content": "群友甲：这模型的正式版还没出吗"},
                         {"role": "assistant", "content": "上了啊\n预览版"},
                     ]
                 },
                 {
                     "messages": [
-                        {"role": "user", "content": "卡了电竞群友乙：你想玩的话我可以给你共享"},
-                        {"role": "assistant", "content": "我们家庭有🤣\n还缺个法环 等打折买一下"},
+                        {"role": "user", "content": "群友乙：Steam打折了 打算买来试试吗"},
+                        {"role": "assistant", "content": "轮到法环打折我就入了"},
                     ]
                 },
                 {
                     "messages": [
                         {"role": "user", "content": "隐私测试"},
-                        {"role": "assistant", "content": "你下一个这个 25373404 xwt123456"},
+                        {"role": "assistant", "content": "你下一个这个 10000001 Example123456"},
                     ]
                 },
                 {
@@ -255,8 +271,8 @@ class StyleRagTest(unittest.TestCase):
             self.assertTrue(hits)
             self.assertIn("法环", hits[0][1])
             formatted = retriever.format_for_prompt("Steam法环打折共享玩一下", limit=2)
-            self.assertNotIn("25373404", formatted)
-            self.assertNotIn("xwt123456", formatted)
+            self.assertNotIn("10000001", formatted)
+            self.assertNotIn("Example123456", formatted)
             self.assertNotIn("打电话给客服", formatted)
 
 
@@ -326,6 +342,86 @@ class ProactiveGateParserTest(unittest.TestCase):
         self.assertEqual(d3.score, 7)
 
         self.assertFalse(mod.parse_gate_response("not valid").should_reply)
+
+
+class LocalMemeBankTest(unittest.TestCase):
+    def test_lists_and_matches_local_memes_by_exact_substring_fuzzy_and_random(self):
+        mod = load_module("meme_bank")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "表情包"
+            folder.mkdir()
+            for fname in ("卡通大笑.gif", "流汗黄豆.png", "猫猫叹气.jpg", "空文件.png"):
+                p = folder / fname
+                p.write_bytes(b"" if fname == "空文件.png" else b"fake-img-bytes")
+            bank = mod.LocalMemeBank(folder)
+            self.assertEqual(len(bank.list_memes()), 3)
+            self.assertEqual(bank.match("流汗黄豆")[0], "流汗黄豆")
+            self.assertEqual(bank.match("大笑")[0], "卡通大笑")
+            self.assertEqual(bank.match("猫叹气")[0], "猫猫叹气")
+            self.assertIsNotNone(bank.match("随机"))
+            self.assertIn("卡通大笑", bank.format_catalog_hint())
+
+            saved = bank.save_from_bytes("新梗图", b"\x89PNG\r\n\x1a\nfake-png")
+            self.assertEqual(saved.name, "新梗图.png")
+            self.assertEqual(bank.match("新梗图")[0], "新梗图")
+
+            rem, tags = mod.extract_meme_tags("笑死 [MEME:示例大笑]")
+            self.assertEqual(rem, "笑死")
+            self.assertEqual(tags, ["示例大笑"])
+            rem2, tags2 = mod.extract_meme_tags("[MEME:示例大笑]")
+            self.assertEqual(rem2, "")
+            self.assertEqual(tags2, ["示例大笑"])
+
+            # Anti-consecutive + cooldown guard
+            self.assertTrue(mod.is_explicit_meme_request("发张表情包"))
+            self.assertTrue(mod.is_explicit_meme_request("斗图啊"))
+            self.assertFalse(mod.is_explicit_meme_request("今天吃啥"))
+            self.assertFalse(
+                mod.can_auto_send_meme(
+                    last_reply_had_meme=True, last_meme_ts=0.0, now_mono=999.0, cooldown_sec=120
+                )
+            )
+            self.assertFalse(
+                mod.can_auto_send_meme(
+                    last_reply_had_meme=False, last_meme_ts=100.0, now_mono=180.0, cooldown_sec=120
+                )
+            )
+            self.assertTrue(
+                mod.can_auto_send_meme(
+                    last_reply_had_meme=False, last_meme_ts=100.0, now_mono=230.0, cooldown_sec=120
+                )
+            )
+
+
+class TuningPanelTest(unittest.TestCase):
+    def test_hot_reloads_knobs_aliases_clamping_and_owner_directives(self):
+        mod = load_module("tuning")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "panel.json"
+            panel = mod.TuningPanel(p)
+            self.assertTrue(p.is_file())
+            self.assertEqual(panel.current().snark_level, 35)
+            self.assertEqual(panel.current().meme_cooldown_sec, 120)
+            self.assertIn("缓和气氛", panel.current().format_meme_guidance())
+
+            key, val = panel.set_knob("冲", 22)
+            self.assertEqual((key, val), ("snark_level", 22))
+            self.assertEqual(panel.current().snark_level, 22)
+
+            mkey, mval = panel.set_knob("表情冷却", 60)
+            self.assertEqual((mkey, mval), ("meme_cooldown_sec", 60))
+
+            # Clamping works out-of-bounds
+            _, capped = panel.set_knob("门卫", 99)
+            self.assertEqual(capped, 10)
+
+            # Owner directives persist and reload
+            panel.add_owner_directive("聊天别叫我Master")
+            reloaded = mod.TuningPanel(p)
+            self.assertEqual(reloaded.current().owner_directives, ("聊天别叫我Master",))
+            self.assertIn("友善", reloaded.current().format_style_calibration())
+            reloaded.clear_owner_directives()
+            self.assertEqual(reloaded.current().owner_directives, ())
 
 
 if __name__ == "__main__":

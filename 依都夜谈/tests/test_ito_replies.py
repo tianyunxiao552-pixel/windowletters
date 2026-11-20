@@ -312,6 +312,34 @@ class ReplyPolicyTest(unittest.TestCase):
             ),
             "ignore",
         )
+        # Ultra-short fragments without '?' (e.g. "可惜") wait instead of firing prematurely
+        self.assertEqual(
+            replies.select_reply(
+                False,
+                True,
+                0.99,
+                0,
+                text="可惜",
+                is_recent_reply_target=True,
+                since_bot_replied_sender=5.0,
+                followup_count=0,
+            ),
+            "ignore",
+        )
+        # Short direct question ending with '？' still triggers follow-up
+        self.assertEqual(
+            replies.select_reply(
+                False,
+                True,
+                0.99,
+                0,
+                text="为啥？",
+                is_recent_reply_target=True,
+                since_bot_replied_sender=10.0,
+                followup_count=0,
+            ),
+            "followup",
+        )
 
 
 if __name__ == "__main__":

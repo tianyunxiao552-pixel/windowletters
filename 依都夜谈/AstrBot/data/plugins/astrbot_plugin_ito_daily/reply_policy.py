@@ -14,6 +14,7 @@ QUOTE_SELF_WINDOW_SECONDS = 90.0
 BURST_MESSAGE_LIMIT = 5
 FOLLOWUP_WINDOW_SECONDS = 45.0
 FOLLOWUP_MAX_TURNS = 1
+FOLLOWUP_MIN_CHARS = 4
 GATE_SCAN_COOLDOWN_SECONDS = 45.0
 GATE_MIN_NEW_MESSAGES = 2
 GATE_MIN_SINGLE_CHARS = 16
@@ -132,6 +133,11 @@ def select_reply(
     use_smart_gate: bool = False,
     since_last_gate_scan: float = float("inf"),
     new_msgs_since_scan: int = 0,
+    proactive_interval: float = PROACTIVE_INTERVAL_SECONDS,
+    gate_scan_cooldown: float = GATE_SCAN_COOLDOWN_SECONDS,
+    image_cooldown: float = IMAGE_COOLDOWN_SECONDS,
+    image_reply_chance: float = IMAGE_REPLY_CHANCE,
+    followup_window: float = FOLLOWUP_WINDOW_SECONDS,
 ) -> str:
     # Owner explicit wake (@mention or quoting bot) bypasses hostile-bait & burst caps.
     if is_owner and mentioned:
@@ -156,9 +162,15 @@ def select_reply(
         and has_plain_text
         and not has_image
         and not is_quoting_other
-        and since_bot_replied_sender <= FOLLOWUP_WINDOW_SECONDS
+        and followup_window > 0
+        and since_bot_replied_sender <= followup_window
         and followup_count < FOLLOWUP_MAX_TURNS
         and (text is None or not is_low_signal_text(text))
+        and (
+            text is None
+            or len(text.strip()) >= FOLLOWUP_MIN_CHARS
+            or text.strip().endswith(("?", "？"))
+        )
     ):
         return "followup"
     if has_image:
@@ -167,7 +179,7 @@ def select_reply(
         if recent_burst_count >= BURST_MESSAGE_LIMIT:
             return "ignore"
         chance_roll = roll if image_roll is None else image_roll
-        if since_last_image >= IMAGE_COOLDOWN_SECONDS and chance_roll < IMAGE_REPLY_CHANCE:
+        if since_last_image >= image_cooldown and chance_roll < image_reply_chance:
             return "image"
         return "ignore"
     if not has_plain_text:
@@ -176,13 +188,13 @@ def select_reply(
         return "ignore"
     if text is not None and is_low_signal_text(text):
         return "ignore"
-    if since_last < PROACTIVE_INTERVAL_SECONDS:
+    if since_last < proactive_interval:
         return "ignore"
     if use_smart_gate:
         enough_signal = new_msgs_since_scan >= GATE_MIN_NEW_MESSAGES or (
             text is not None and len(text.strip()) >= GATE_MIN_SINGLE_CHARS
         )
-        if since_last_gate_scan >= GATE_SCAN_COOLDOWN_SECONDS and enough_signal:
+        if since_last_gate_scan >= gate_scan_cooldown and enough_signal:
             return "gate_check"
         return "ignore"
     if roll < PROACTIVE_CHANCE:

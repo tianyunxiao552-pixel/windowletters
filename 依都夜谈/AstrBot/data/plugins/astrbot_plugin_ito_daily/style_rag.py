@@ -38,7 +38,6 @@ _AGGRESSIVE_KEYWORDS = (
     "畜生",
     "傻🐦",
     "笑成区",
-    "闹麻",
     "够童",
     "招笑",
     "煞笔",
@@ -91,7 +90,7 @@ _META_NOISE_KEYWORDS = (
     "https://",
 )
 _PRIVACY_RE = re.compile(
-    r"(?:\b\d{7,}\b|[A-Za-z]{2,}\d{5,}|身份证|银行卡|手机号|验证码|密码|收件地址|学住费|航财通|xwt\d+)",
+    r"(?:\b\d{7,}\b|[A-Za-z]{2,}\d{5,}|身份证|银行卡|手机号|验证码|密码|收件地址|学住费|航财通)",
     re.I,
 )
 _WORD_RE = re.compile(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", re.I)
@@ -256,7 +255,14 @@ class StyleCorpusRetriever:
             pass
         return True
 
-    def retrieve(self, query: str, *, limit: int = 3, banter_level: int = 1) -> list[tuple[str, str]]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        limit: int = 3,
+        banter_level: int = 1,
+        witty_multiplier: float = 1.25,
+    ) -> list[tuple[str, str]]:
         if not self._pairs or not query.strip():
             return []
         q_toks = _tokenize(query)
@@ -276,7 +282,7 @@ class StyleCorpusRetriever:
                 if 4 <= len(reply) <= 45:
                     score *= 1.12
                 if banter_level >= 2 and tone == "witty":
-                    score *= 1.25
+                    score *= witty_multiplier
                 elif banter_level <= 0 and tone == "chill":
                     score *= 1.15
                 scored.append((score, idx))
@@ -315,8 +321,20 @@ class StyleCorpusRetriever:
                     tried += 1
         return picked
 
-    def format_for_prompt(self, query: str, *, limit: int = 3, banter_level: int = 1) -> str:
-        hits = self.retrieve(query, limit=limit, banter_level=banter_level)
+    def format_for_prompt(
+        self,
+        query: str,
+        *,
+        limit: int = 3,
+        banter_level: int = 1,
+        witty_multiplier: float = 1.25,
+    ) -> str:
+        hits = self.retrieve(
+            query,
+            limit=limit,
+            banter_level=banter_level,
+            witty_multiplier=witty_multiplier,
+        )
         if not hits:
             return ""
         lines = []

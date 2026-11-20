@@ -16,6 +16,9 @@ _ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _BULLET_RE = re.compile(r"(?m)^\s*[-*•]\s+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
+# Trim Gemini 3.8's repetitive Chinese internet-slang crutches ("属于是" / declarative "是吧") at line ends.
+_SHUYUSHI_TAIL_RE = re.compile(r"(?:[，,\s]*)属于是(?=[。！!？?~\s\n]|$)")
+_SHIBA_CRUTCH_RE = re.compile(r"(?<![不就还也才算])(?:[，,\s]*)是吧(?=[。！!~\s\n]|$)")
 
 
 def is_skip_reply(text: str) -> bool:
@@ -39,6 +42,9 @@ def clean_wechat_text(text: str, *, preserve_structure: bool = False) -> str:
     cleaned = _INLINE_CODE_RE.sub(r"\1", cleaned)
     if not preserve_structure:
         cleaned = _BULLET_RE.sub("", cleaned)
+        if len(cleaned) > 5:
+            cleaned = _SHUYUSHI_TAIL_RE.sub("", cleaned)
+            cleaned = _SHIBA_CRUTCH_RE.sub("", cleaned)
     cleaned = _BLANK_LINES_RE.sub("\n\n", cleaned)
     return cleaned.strip()
 
